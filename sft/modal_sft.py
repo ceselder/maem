@@ -115,6 +115,9 @@ MN_GPU = os.environ.get("SFT_MN_GPU", "B200:8")
 MN_RDMA = os.environ.get("SFT_MN_RDMA", "0") == "1"
 MN_PORT = 29500                                       # torchrun (static c10d) rendezvous port on the rank-0 container
 MN_RDZV_TIMEOUT_S = 3600                              # nodes reach torchrun at different times (per-node bank staging)
+# The container re-imports this module WITHOUT the deploy-time env, so the constants above would silently fall back to
+# their defaults there (first smoke: cluster of 2 vs N_NODES=4). This secret carries them into the container env.
+_MN_CONFIG = modal.Secret.from_dict({"SFT_N_NODES": str(N_NODES), "SFT_MN_GPU": MN_GPU, "SFT_MN_RDMA": "1" if MN_RDMA else "0"})
 
 
 VEC_BANK_FILES = (("vecs.f32", 4), ("vecs.f16", 2))   # (filename, bytes per element); same as pretrain.py
@@ -299,8 +302,15 @@ def _cluster():
     return ci.rank, len(ci.container_ips), ci.container_ips[0], ci.cluster_id
 
 
-def _gpus_per_node(gpu_spec: str) -> int:
-    return int(gpu_spec.split(":")[1]) if ":" in gpu_spec else 1
+def _gpus_per_node() -> int:
+    """GPUs visible in this container (authoritative), falling back to the deploy-time gpu spec."""
+    try:
+        import torch
+        if torch.cuda.device_count():
+            return torch.cuda.device_count()
+    except Exception:  # noqa
+        pass
+    return int(MN_GPU.split(":")[1]) if ":" in MN_GPU else 1
 
 
 def _torchrun_multinode(rank: int, size: int, master: str, nproc: int):
@@ -364,6 +374,7 @@ def train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
     secrets=[
         modal.Secret.from_name("maemm-hf"),
         modal.Secret.from_name("maemm-wandb"),
+        _MN_CONFIG,
     ],
     timeout=86400,
     ephemeral_disk=int(os.environ.get("SFT_DISK_GB", "600")) * 1024,   # EVERY node stages its own bank copy (_preflight)
@@ -387,10 +398,11 @@ def train_multinode(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int
     import os
 
     rank, size, master, cluster_id = _cluster()
-    nproc = _gpus_per_node(MN_GPU)
+    nproc = _gpus_per_node()
     world = size * nproc
     tag = f"modal-mn{rank}/{size}"
-    assert size == n_nodes == N_NODES, f"cluster size {size} != n_nodes {n_nodes} / deployed SFT_N_NODES {N_NODES}"
+    # get_cluster_info() is authoritative; n_nodes is the caller's intent (effective-batch arithmetic depends on it)
+    assert size == n_nodes, f"cluster size {size} != n_nodes {n_nodes} (deployed SFT_N_NODES={N_NODES})"
     is_leader = rank == 0
     toks = extra_args.split()
     accum = int(toks[toks.index("--grad-accum") + 1]) if "--grad-accum" in toks else 1
@@ -441,6 +453,7 @@ def train_multinode(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int
     image=image,
     gpu=MN_GPU,
     volumes={"/data": vol},
+    secrets=[_MN_CONFIG],
     timeout=1800,
     memory=64 * 1024,
 )
@@ -461,7 +474,7 @@ def cluster_check(allreduce_mb: int = 1800, read_gb: float = 0.0,
 
     ci = modal.experimental.get_cluster_info()
     rank, size, master, cluster_id = _cluster()
-    nproc = _gpus_per_node(MN_GPU)
+    nproc = _gpus_per_node()
     tag = f"cluster-check r{rank}/{size}"
     print(f"[{tag}] cluster {cluster_id} host={socket.gethostname()} ips={ci.container_ips} "
           f"ipv4={ci.container_ipv4_ips} fabric_ids={ci.fabric_ids} rdma_requested={MN_RDMA}", flush=True)
