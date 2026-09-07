@@ -8,6 +8,9 @@ HF cache with the LoRA adapter at /data/sft_mix/last5_rp/final (or a fresh rsLoR
     modal run sft/test_prefix_cache.py::equiv --batch 8 --seed 0          # naive vs prefix-cached, autocast off+on
     modal run sft/test_prefix_cache.py::bench --steps 10 --compile 1      # ex/s table naive mb16 vs cached 16/64/128
     PFX_GPU=H200:1 PFX_TRITON=3.7.1 modal run ...                           # Hopper fallback (fla GDN bwd needs triton>=3.7.1)
+    modal run sft/test_prefix_cache.py::share_step --batch 64 --grad-accum 8
+    modal run sft/test_prefix_cache.py::bench --steps 5 \
+        --configs cached_gradaccum:64x8,cached_sharedstep:64x8
 
 Results are printed and also written locally to sft/results/prefix_cache_{equiv,bench}.json by the entrypoints.
 """
@@ -463,6 +466,7 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
     def run_case(name, B, fn, cleanup=None):
         row = {"config": name, "micro_batch": B}
         try:
+            gen.manual_seed(seed)  # identical examples/lengths across compared configurations
             torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
             t_first = time.time(); fn(); torch.cuda.synchronize(); row["first_step_s"] = time.time() - t_first
             # warm up BOTH shape extremes: Triton specializes int args (seq len) on divisibility by 16, so a new
@@ -500,6 +504,33 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
                 cleanup()
         results["rows"].append(row)
 
+    def make_step_accum(B, n_accum, share):
+        """Match pretrain.py --grad-accum: mean of micro-batch token-mean losses."""
+        pc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device)
+        ac = lambda: autocast_region(model, autocast_on)
+
+        def step(force_len=None):
+            accum = pcmod.PrefixGradientAccumulator(pc.run_prefix(ac)) if share else None
+            n_tok = L = 0
+            for _ in range(n_accum):
+                vecs, targets = batch_gen(B, force_len)
+                out = pc.forward(vecs, targets, autocast=ac,
+                                 prefix_cache=accum.cache if accum is not None else None)
+                (out.loss / n_accum).backward()
+                if accum is not None:
+                    accum.accumulate()
+                n_tok += out.n_target_tokens
+                L = max(L, out.suffix_len)
+                del out
+            if accum is not None:
+                accum.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            return B * n_accum, n_tok, L
+
+        return step
+
     for spec in configs.split(","):
         kind, Bs = spec.split(":")
         B, n_acc = (int(Bs.split("x")[0]), int(Bs.split("x")[1])) if "x" in Bs else (int(Bs), 1)
@@ -522,12 +553,80 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
             fn, cl = make_cached(B, False, n_acc, compile_mlp=True); run_case(label, B * n_acc, fn, cl)
         elif kind == "cached_pad16":
             fn, cl = make_cached(B, False, n_acc, pad_multiple=16); run_case(label, B * n_acc, fn, cl)
+        elif kind in ("cached_gradaccum", "cached_sharedstep"):
+            run_case(label, B * n_acc, make_step_accum(B, n_acc, kind == "cached_sharedstep"))
         else:
             raise ValueError(spec)
     if compile_:
         for B in (16, 64):
             fn, cl = make_cached(B, True); run_case("cached_compile", B, fn, cl)
     return _plain(results)
+
+
+@app.function(image=image, gpu=GPU, volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=1800)
+def share_step_remote(adapter: str = ADAPTER, batch: int = 64, grad_accum: int = 8, seed: int = 0,
+                      fresh_lora: bool = False):
+    """B200 BF16 loss/gradient parity: repeated prefix vs one prefix per optimizer step."""
+    import sys
+    import torch
+
+    sys.path.insert(0, "/pmx/helpers"); sys.path.insert(0, "/pmx")
+    from mxf.config import D_MODEL, INJECT_LAYER, STEER_COEFF
+    from mxf.inject import get_layer
+    from mxf.prompts import build_prompt_ids
+    from sft.prefix_cache import PrefixCache, PrefixGradientAccumulator
+    from sft.pretrain import autocast_region
+
+    assert batch > 0 and grad_accum > 0
+    env = _env_report()
+    tok, model = _load(adapter, fresh_lora)
+    params = [p for p in model.parameters() if p.requires_grad]
+    prompt, marker = build_prompt_ids(tok)
+    pc = PrefixCache(model, prompt, marker[0], tok.pad_token_id, get_layer(model, INJECT_LAYER),
+                     STEER_COEFF, "cuda:0")
+    ac = lambda: autocast_region(model, True)
+    gen = torch.Generator().manual_seed(seed)
+    data = [_random_batch(gen, batch, D_MODEL, tok.vocab_size, 8, 32, tok.eos_token_id)
+            for _ in range(grad_accum)]
+
+    def backward(share):
+        model.zero_grad(set_to_none=True)
+        accum = PrefixGradientAccumulator(pc.run_prefix(ac)) if share else None
+        loss = torch.zeros((), device="cuda")
+        for vecs, targets in data:
+            out = pc.forward(vecs, targets, autocast=ac, prefix_cache=accum.cache if share else None)
+            (out.loss / grad_accum).backward()
+            loss += out.loss.detach() / grad_accum
+            if share:
+                accum.accumulate()
+            del out
+        if share:
+            accum.backward()
+        return float(loss), _flat_grads(params).cpu()
+
+    loss_ref, grads_ref = backward(False)
+    loss_shared, grads_shared = backward(True)
+    cmp = _cmp_grads(grads_ref, grads_shared)
+    result = {"env": env, "batch": batch, "grad_accum": grad_accum,
+              "loss_repeated": loss_ref, "loss_shared": loss_shared,
+              "loss_abs_diff": abs(loss_ref - loss_shared), "gradients": cmp}
+    # A shared bf16 prefix changes reduction order, not the objective. Report the
+    # complete metrics and reject differences beyond the existing bf16 parity regime.
+    result["ok"] = abs(loss_ref - loss_shared) < 1e-3 and cmp["cosine"] > 0.999 and cmp["rel_l2"] < 0.02
+    _plain(result)
+    assert result["ok"], f"shared-prefix gradient parity failed: {result}"
+    return result
+
+
+@app.local_entrypoint()
+def share_step(adapter: str = ADAPTER, batch: int = 64, grad_accum: int = 8, seed: int = 0,
+               fresh_lora: bool = False):
+    result = share_step_remote.remote(adapter=adapter, batch=batch, grad_accum=grad_accum,
+                                      seed=seed, fresh_lora=fresh_lora)
+    out = REPO / "sft" / "results" / "prefix_share_step_equiv.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"wrote {out}")
 
 
 @app.local_entrypoint()

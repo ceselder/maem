@@ -105,7 +105,30 @@ def test_vec_bank_f16_and_f32():
     print("vec bank f32/f16: OK")
 
 
+def test_batched_tokenization_matches_per_record_chat_template():
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    from mxf.prompts import MARKER, build_sft_ids
+
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "[EOS]": 1, "[PAD]": 2,
+                                         "hello": 3, "world": 4}, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="[EOS]", pad_token="[PAD]",
+                                 unk_token="[UNK]", additional_special_tokens=[MARKER])
+    tok.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %} assistant"
+    records = [{"vec_idx": i * 3, "target_text": text} for i, text in enumerate(
+        ["hello world", "", "héllo 世界\nworld", "hello " * 200, "[EOS] hello", "world", "   "])]
+    for max_seq in (64, 192, 512):
+        expected = []
+        for record in records:
+            ids, labels, positions = build_sft_ids(tok, record["target_text"])
+            expected.append((ids[:max_seq], labels[:max_seq], positions, record["vec_idx"]))
+        for chunk in (1, 3, 4096):
+            assert pretrain.tokenize_records(records, tok, max_seq, chunk_size=chunk) == expected
+
+
 if __name__ == "__main__":
     test_loss_and_grad_parity()
     test_vec_bank_f16_and_f32()
+    test_batched_tokenization_matches_per_record_chat_template()
     print("ALL_TESTS_PASSED")

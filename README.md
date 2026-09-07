@@ -102,6 +102,50 @@ python eval/eval_universal.py --adapter ckpts/rl/final \
 `mxf/config.py` — `MODEL`, `D_MODEL`, `READ_LAYER`, `INJECT_LAYER`, `STEER_COEFF`, corpus, LoRA/RL hparams.
 Defaults: rsLoRA r64/α16 all-linear, AdamW lr 3e-5 (SFT) / 1e-5 (RL).
 
+## B200 pretraining with gradient accumulation
+
+For the LoRA SFT path, `--prefix-cache --prefix-share-step` computes the common,
+**pre-injection prefix once per optimizer step**, including its backward pass, across
+both `--grad-accum` and `--prefix-accum` micro-batches. The injected marker and every
+token after it are computed separately for each example; they are never shared.
+The prefix cache is rebuilt after each optimizer update. Cache gradients accumulate in FP32 and propagate
+through the prefix before the completed parameter gradients are averaged across GPUs.
+The prefix still learns. The loss weighting, batch order, and optimizer schedule are
+preserved; BF16 gradient summation order changes, so updates are not bit-identical.
+
+Add `--prefix-share-step` to an existing prefix-cache run, for example:
+
+```bash
+python sft/pretrain.py --data-dir data/pool_sft \
+  --prefix-cache --prefix-share-step --grad-ckpt 0 --autocast-bf16 \
+  --batch-size 64 --grad-accum 8 --max-seq 160
+```
+
+This remains opt-in pending B200 throughput/parity measurements. It requires zero
+dropout and the existing transformers prefix-cache fork
+(`ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3`); full-FT/FSDP2
+is not supported by this flag. Batch 64 is intended for short targets; longer targets
+may need smaller micro-batches. The Modal launcher passes the flag through `extra_args`.
+
+Pretraining also batch-tokenizes target text and constructs the shared chat prompt once
+when loading a bank. That startup optimization is enabled for all training paths.
+
+CPU loss/gradient, optimizer-step, and two-rank synchronization checks:
+
+```bash
+OMP_NUM_THREADS=1 python -m pytest -q sft/test_prefix_sharing.py sft/test_head_on_labels.py
+```
+
+The existing B200 harness can check BF16 gradient parity, then compare throughput on
+identical synthetic batches without changing model weights or production checkpoints:
+
+```bash
+modal run sft/test_prefix_cache.py::share_step --batch 64 --grad-accum 8
+modal run sft/test_prefix_cache.py::bench --steps 5 \
+  --configs cached_gradaccum:64x8,cached_sharedstep:64x8 \
+  --out sft/results/prefix_share_step_bench.json
+```
+
 ## Scaling & infra
 
 - **Data-parallel RL (gloo DDP) — `rl/rl_ddp.sh`.** `rl/rl.py` is DDP-aware: under torchrun,

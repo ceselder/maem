@@ -11,6 +11,10 @@ Speed knobs (all exact -- none changes the optimization):
     --grad-ckpt 0 --autocast-bf16                                     no recompute, bf16 LoRA matmuls
     --head-on-labels                                                  lm_head + CE only at label positions
     --grad-accum N                                                    N micro-batches per optimizer step
+    --prefix-cache --prefix-share-step                               one prefix fwd/bwd per optimizer step
+    --pad-multiple 1                                                  --prefix-cache: no suffix-length rounding (default 8 = ~15% pad)
+Composition knob (NOT exact -- changes which examples share an optimizer step, not the objective):
+    --length-bucket   i.i.d. example windows per optimizer step, length-sorted into micro-batches (see step_groups)
 """
 import argparse
 import contextlib
@@ -68,6 +72,27 @@ def open_vec_bank(data_dir, n_vecs):
 def gather_rows(vecs, idx):
     """Bank rows -> float32 CPU tensor (f16 banks are upcast here; f32 rows are a plain copy)."""
     return torch.from_numpy(np.array(vecs[idx], dtype=np.float32))   # np.array = always a writable copy
+
+
+def tokenize_records(records, tok, max_seq, chunk_size=4096):
+    """Tokenize targets in batches and build the constant chat prompt only once.
+
+    Same IDs/labels/truncation as build_sft_ids per record, without millions of repeated
+    chat-template calls. Bounded tokenizer batches keep startup memory independent of
+    the bank size beyond the tokenized rows the trainer already retains.
+    """
+    prompt, positions = build_prompt_ids(tok)
+    prompt_labels = [-100] * len(prompt)
+    rows = []
+    for start in range(0, len(records), chunk_size):
+        chunk = records[start:start + chunk_size]
+        targets = tok([r["target_text"] for r in chunk], add_special_tokens=False,
+                      padding=False, truncation=False)["input_ids"]
+        for record, ids in zip(chunk, targets):
+            target = list(ids) + [tok.eos_token_id]
+            rows.append(((prompt + target)[:max_seq], (prompt_labels + target)[:max_seq],
+                         positions, record["vec_idx"]))
+    return rows
 
 
 class LabelHeadLM(torch.nn.Module):
@@ -212,6 +237,43 @@ def packed_attn_mask(seg, causal, dtype):
     return torch.where(allowed, zero, neg)
 
 
+def step_groups(lengths, batch_size, grad_accum, epoch, length_bucket=False):
+    """Micro-batch composition for one epoch of the per-example path: a list of optimizer-step groups, each a list
+    of index arrays (micro-batches) into the per-rank example list. A pure function of (lengths, epoch, flags) with
+    no hidden state, so --skip-steps fast-forwarding lands on exactly the micro-batches an uninterrupted run used,
+    and every DDP rank (equal shards) gets the same group/micro-batch shapes.
+
+    default (legacy, byte-identical order to the old inline code): stable-sort ALL examples by length, cut into
+        batch_size micro-batches -- each one nearly length-homogeneous, so intra-micro-batch padding is already ~0
+        (measured 0.3-1.2% before --pad-multiple rounding) -- shuffle the micro-batches, take grad_accum consecutive
+        ones per step. Consequence: an optimizer step is grad_accum whole length-buckets, i.e. only grad_accum
+        distinct target lengths per rank per step (one at grad_accum=1), and per-step token counts swing with them.
+    length_bucket: shuffle EXAMPLES (seeded by epoch), cut the order into windows of grad_accum*batch_size -- one
+        window = one optimizer step = an i.i.d. sample of the shard, so every step is a representative mix of
+        lengths -- then stable-sort each window by length and cut it into grad_accum micro-batches. The multiset of
+        examples per step is exactly the window (the un-sorted random order would give the same per-step set; only
+        the grouping into micro-batches changes), and intra-micro-batch padding stays small because each micro-batch
+        spans ~1/grad_accum of the window's length range (measured on 8-32-token targets: 2.5% at grad_accum 32,
+        7% at 8, 12% at 4 with --pad-multiple 1; a randomly composed micro-batch pads 35-43%). Loss normalisation is
+        untouched in both modes: each micro-batch's HF mean-over-its-target-tokens loss is scaled by 1/grad_accum.
+    """
+    lengths = np.asarray(lengths)
+    n = len(lengths)
+    if not length_bucket:
+        order = np.argsort(lengths, kind="stable")                       # == list.sort(key=len): stable
+        micro = [order[s : s + batch_size] for s in range(0, n, batch_size)]
+        np.random.default_rng(epoch).shuffle(micro)                      # same draw as shuffling the old list of lists
+        return [micro[s : s + grad_accum] for s in range(0, len(micro), grad_accum)]
+    perm = np.random.default_rng(epoch).permutation(n)
+    window = batch_size * grad_accum
+    groups = []
+    for s in range(0, n, window):
+        w = perm[s : s + window]
+        w = w[np.argsort(lengths[w], kind="stable")]                     # ties broken by position -> deterministic
+        groups.append([w[k : k + batch_size] for k in range(0, len(w), batch_size)])
+    return groups
+
+
 def main():
     cfg = TrainConfig()
     ap = argparse.ArgumentParser()
@@ -259,6 +321,20 @@ def main():
                          "forward (token-weighted losses => identical to one big-batch mean-loss step). Amortizes the "
                          "B=1 prefix fwd+bwd (~225 ms/step on B200) and lowers peak memory: e.g. --batch-size 128 "
                          "--prefix-accum 2 fits one B200 where a single 128 micro-batch OOMs.")
+    ap.add_argument("--prefix-share-step", action="store_true",
+                    help="LoRA + --prefix-cache: share one prefix forward AND backward across all --grad-accum / "
+                         "--prefix-accum micro-batches of an optimizer step. Accumulates cache gradients in fp32, "
+                         "then reduces completed parameter gradients once. Same objective; bf16 reduction order differs.")
+    ap.add_argument("--pad-multiple", type=int, default=8,
+                    help="--prefix-cache: round each micro-batch's padded suffix length up to a multiple of N. The legacy 8 "
+                         "pads ~15%% of suffix tokens on 8-32-token targets (micro-batches are already length-sorted, so "
+                         "rounding is nearly ALL the padding); 1 = pad only to the longest suffix. Exact (pads carry no loss).")
+    ap.add_argument("--length-bucket", action="store_true",
+                    help="per-example path: compose each optimizer step from an i.i.d. window of grad-accum x batch-size "
+                         "examples (seeded shuffle), length-sorted into its micro-batches (see step_groups). Default = the "
+                         "legacy order: length-sorted micro-batches shuffled whole, so a step is only grad-accum distinct "
+                         "lengths. Changes which examples share a step, not the loss formula; deterministic, so "
+                         "--skip-steps resume stays exact. Not for --pack-len.")
     ap.add_argument("--fp8-base", action="store_true",
                     help="EXPERIMENTAL: run the frozen base linears in torchao float8 (fwd + grad_input GEMMs; LoRA A/B, "
                          "lm_head, embeddings and the 5120->48 GDN gates stay bf16). Recipe via MAEMM_FP8_RECIPE "
@@ -285,6 +361,10 @@ def main():
     ap.add_argument("--wandb-id", default="", help="crash-resume: continue this wandb run id (resume='allow')")
     a = ap.parse_args()
     assert a.grad_accum >= 1, "--grad-accum must be >= 1"
+    assert not a.prefix_share_step or (a.prefix_cache and not a.full_ft), \
+        "--prefix-share-step requires --prefix-cache and LoRA (FSDP2/full-ft is not supported)"
+    assert a.pad_multiple >= 1, "--pad-multiple must be >= 1"
+    assert not (a.length_bucket and a.pack_len), "--length-bucket is for the per-example path (no --pack-len)"
 
     world = int(os.environ.get("WORLD_SIZE", 1)); rank = int(os.environ.get("RANK", 0))
     local = int(os.environ.get("LOCAL_RANK", 0)); is_main = rank == 0
@@ -403,33 +483,42 @@ def main():
     prefix_cache = None
     if a.prefix_cache:
         try:
-            from sft.prefix_cache import PrefixCache  # repo layout (needs the transformers fork; checked inside)
+            from sft.prefix_cache import PrefixCache, PrefixGradientAccumulator, sync_accumulated_gradients
         except ImportError:  # mounted next to this file (modal_sft.py puts both under /pmx/SL/)
             import sys
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from prefix_cache import PrefixCache
+            from prefix_cache import PrefixCache, PrefixGradientAccumulator, sync_accumulated_gradients
         assert not a.pack_len, "--prefix-cache is the per-example path (no --pack-len)"
         assert not a.head_on_labels, "--prefix-cache uses HF's loss on the short suffix (its head cost is already ~all labels); not combinable with --head-on-labels"
         assert not a.grad_ckpt, "--prefix-cache needs --grad-ckpt 0 (GradientCheckpointingLayer drops past_key_values)"
         prompt_ids, mpos = build_prompt_ids(tok)
         # suffix forward through `ddp` (primes DDP's reducer once per step), prefix forward through the bare model
         prefix_cache = PrefixCache(ddp, prompt_ids, mpos[0], tok.pad_token_id, submodule, STEER_COEFF, device,
-                                   prefix_model=model, persistent_injector=persistent_injector,
+                                   prefix_model=model, persistent_injector=persistent_injector, pad_multiple=a.pad_multiple,
                                    # FSDP2 registers backward hooks on the layer output: inject on a clone, never in place;
                                    # and its pre-backward unshard hangs on module outputs -> the prefix output needs a grad path
                                    inject_mode="add_clone" if a.full_ft else "add", keep_prefix_grad_path=a.full_ft)
         assert a.prefix_accum >= 1 and a.batch_size % a.prefix_accum == 0, "--prefix-accum must divide --batch-size"
+        if a.prefix_share_step:
+            # Sharing stochastic prefix computations changes the objective. This trainer creates
+            # zero-dropout LoRAs, but reject a resumed adapter/base with active dropout as well.
+            assert not any(isinstance(m, torch.nn.Dropout) and m.p > 0 for m in model.modules()), \
+                "--prefix-share-step requires zero dropout"
         if is_main:
             print(f"[pretrain] prefix-cache ON: shared prefix {prefix_cache.prefix_len} tokens, suffix = "
                   f"{len(prefix_cache.suffix_prompt)} prompt token(s) + target, prefix shared by {a.prefix_accum} "
-                  f"micro-batch(es) of {a.batch_size // a.prefix_accum}", flush=True)
+                  f"micro-batch(es) of {a.batch_size // a.prefix_accum}, suffix padded to a multiple of {a.pad_multiple}",
+                  flush=True)
+            if a.prefix_share_step:
+                print("[pretrain] prefix-share-step ON: one prefix fwd/bwd per optimizer step; "
+                      "fp32 cache-gradient accumulation, one parameter-gradient reduction", flush=True)
 
     # pre-tokenize once. Packed path: shuffle-once greedy packing into fixed pack-len blocks (zero
     # intra-block padding, one static shape for compile). Legacy path: length-bucketed padded batches.
-    toks_cache = []
-    for r in records:
-        ids, labs, pos = build_sft_ids(tok, r["target_text"])
-        toks_cache.append((ids[: a.max_seq], labs[: a.max_seq], pos, r["vec_idx"]))
+    t_tokenize = time.time()
+    toks_cache = tokenize_records(records, tok, a.max_seq)
+    if is_main:
+        print(f"[pretrain] tokenized {len(toks_cache)} local records in {time.time() - t_tokenize:.1f}s", flush=True)
     if a.pack_len:
         blocks = pack_examples(toks_cache, a.pack_len, seed=0)
         if world > 1:  # equalize block count across ranks (packing yields ±1 per rank → DDP deadlock)
@@ -444,8 +533,12 @@ def main():
             print(f"packed: {len(blocks)} blocks of {a.pack_len} (fill {fill:.1%}), "
                   f"{bper} micro-batches/epoch x {a.pack_blocks} blocks", flush=True)
     else:
-        toks_cache.sort(key=lambda t: len(t[0]))
+        # micro-batch composition per epoch: step_groups (default = legacy length-sorted buckets; --length-bucket =
+        # i.i.d. windows sorted within the step). Lengths are of the full prompt+target row (prompt is constant).
+        ex_lengths = np.fromiter((len(t[0]) for t in toks_cache), dtype=np.int64, count=len(toks_cache))
         micro_per_epoch = math.ceil(len(toks_cache) / a.batch_size)
+        if is_main:
+            print(f"[pretrain] micro-batch composition: {'length-bucket (i.i.d. step windows, length-sorted micro-batches)' if a.length_bucket else 'legacy (length-sorted micro-batches, shuffled whole)'}", flush=True)
     # one optimizer step per --grad-accum micro-batches (the last group of an epoch may be shorter)
     steps_total = math.ceil(micro_per_epoch / a.grad_accum) * a.epochs
     # warmup >= 2 optimizer steps: OneCycleLR divides by (pct_start*total_steps - 1), which is 0 for runs of
@@ -480,10 +573,9 @@ def main():
             order = np.random.default_rng(ep).permutation(len(blocks))
             micro = [[blocks[i] for i in order[s : s + a.pack_blocks]]
                      for s in range(0, bper * a.pack_blocks, a.pack_blocks)]
+            groups = [micro[s : s + a.grad_accum] for s in range(0, len(micro), a.grad_accum)]
         else:
-            micro = [toks_cache[s : s + a.batch_size] for s in range(0, len(toks_cache), a.batch_size)]
-            np.random.default_rng(ep).shuffle(micro)
-        groups = [micro[s : s + a.grad_accum] for s in range(0, len(micro), a.grad_accum)]
+            groups = step_groups(ex_lengths, a.batch_size, a.grad_accum, ep, a.length_bucket)
         for group in groups:
             if step < a.skip_steps:  # crash-resume fast-forward (see --skip-steps help)
                 sched.step(); step += 1
@@ -493,12 +585,20 @@ def main():
                 torch.cuda.synchronize()  # drain queued work so the timed step is only this step
             t0 = time.time()
             n_real_step = n_ex_step = 0
+            n_pad_real = n_pad_slots = 0     # padding accounting: real tokens vs padded slots in the padded tensors (prefix path: suffix only)
             loss_step = torch.zeros((), device=device)
             probe_ctx = (FT.injection_probe(model, INJECT_LAYER, log=print) if (a.full_ft and step == a.skip_steps and is_main)
                          else contextlib.nullcontext())
             probe_ctx.__enter__()
+            shared_prefix = None
+            if a.prefix_share_step:
+                ac = lambda: autocast_region(model, a.autocast_bf16)
+                shared_prefix = PrefixGradientAccumulator(prefix_cache.run_prefix(ac))
+                n_real_step += prefix_cache.prefix_len
             for mi, batch in enumerate(group):
                 last_in_group = mi == len(group) - 1
+                if not a.pack_len:
+                    batch = [toks_cache[i] for i in batch]      # index array -> (ids, labels, pos, vec_idx) rows
                 if prefix_cache is not None:
                     # ---- --prefix-cache micro-batch: shared prompt prefix once, [marker]+target per example on the
                     # expanded cache (sft/prefix_cache.py; exact incl. gradients). toks_cache rows are prompt+target ids
@@ -507,13 +607,38 @@ def main():
                     targets = [t[0][n_prompt:] for t in batch]
                     vmat = gather_rows(vecs, [t[3] for t in batch])
                     ac = lambda: autocast_region(model, a.autocast_bf16)  # noqa: E731
-                    if a.prefix_accum == 1:
+                    if shared_prefix is not None:
+                        # All suffix backwards stop at the cache leaves. The prefix is traversed
+                        # once below, before clipping/Adam. DDP must not reduce partial gradients.
+                        n_tot = sum(len(t) for t in targets)
+                        if n_tot == 0:
+                            raise ValueError("prefix-cache batch has no target tokens; increase --max-seq")
+                        mb = a.batch_size // a.prefix_accum
+                        loss = torch.zeros((), device=device)
+                        n_real = 0
+                        for start in range(0, len(batch), mb):
+                            sl = slice(start, start + mb)
+                            ctx = ddp.no_sync() if world > 1 else contextlib.nullcontext()
+                            with ctx:
+                                out = prefix_cache.forward(vmat[sl], targets[sl], autocast=ac,
+                                                           prefix_cache=shared_prefix.cache)
+                                weight = out.n_target_tokens / n_tot
+                                (out.loss * weight / len(group)).backward()
+                            shared_prefix.accumulate()
+                            loss += out.loss.detach() * weight
+                            n_suf = int(out.suffix_mask.sum())
+                            n_real += n_suf
+                            n_pad_real += n_suf; n_pad_slots += out.suffix_len * out.suffix_mask.shape[0]
+                            del out
+                    elif a.prefix_accum == 1:
                         sync_ctx = ddp.no_sync() if (world > 1 and not last_in_group) else contextlib.nullcontext()
                         with sync_ctx:
                             out = prefix_cache.forward(vmat, targets, autocast=ac)
                             loss = out.loss
                             (loss / len(group)).backward()
-                        n_real = prefix_cache.prefix_len + int(out.suffix_mask.sum())
+                        n_suf = int(out.suffix_mask.sum())
+                        n_pad_real += n_suf; n_pad_slots += out.suffix_len * len(batch)
+                        n_real = prefix_cache.prefix_len + n_suf
                     else:
                         # one prefix forward, N micro-batches on copy-expanded caches; loss_k * (n_k / N_tokens) summed
                         # == the single mean-over-target-tokens loss, so the update is identical to one big micro-batch
@@ -530,7 +655,9 @@ def main():
                                 o = prefix_cache.forward(vmat[sl], targets[sl], autocast=ac, prefix_cache=cache0)
                                 (o.loss * (o.n_target_tokens / n_tot) / len(group)).backward(retain_graph=not last)
                             loss_val += o.loss.item() * o.n_target_tokens / n_tot
-                            n_real += int(o.suffix_mask.sum())
+                            n_suf = int(o.suffix_mask.sum())
+                            n_real += n_suf
+                            n_pad_real += n_suf; n_pad_slots += o.suffix_len * o.suffix_mask.shape[0]
                             del o
                         del cache0
                         loss = torch.tensor(loss_val, device=device)
@@ -549,6 +676,7 @@ def main():
                     kw = dict(input_ids=input_ids.to(device), attention_mask=mask4,
                               position_ids=pos_ids.to(device), labels=labels.to(device), use_cache=False)
                     n_ex_step += sum(len(blk["seg_lens"]) for blk in batch)
+                    n_pad_real += n_real; n_pad_slots += len(batch) * a.pack_len
                 else:
                     L = max(len(t[0]) for t in batch)
                     L = min(((L + 63) // 64) * 64, a.max_seq)  # round to mult-of-64 → ≤3 static shapes for compile
@@ -561,6 +689,7 @@ def main():
                         labels[i, : len(ll)] = torch.tensor(ll)
                         attn[i, : len(ii)] = True
                     n_real = int(attn.sum())
+                    n_pad_real += n_real; n_pad_slots += len(batch) * L      # includes the multiple-of-64 rounding
                     if persistent_injector is not None:
                         # One memmap gather + H2D copy, versus one tiny transfer per row in the legacy
                         # hook. The registered hook reads this stable buffer inside the compiled graph.
@@ -586,6 +715,11 @@ def main():
                     loss = out if a.head_on_labels else out.loss
                     (loss / len(group)).backward()
                 loss_step += loss.detach() / len(group)
+            if shared_prefix is not None:
+                ctx = ddp.no_sync() if world > 1 else contextlib.nullcontext()
+                with ctx:
+                    shared_prefix.backward()
+                sync_accumulated_gradients(model.parameters())
             probe_ctx.__exit__(None, None, None)
             if a.full_ft:
                 FT.clip_grad_norm([p for p in model.parameters() if p.requires_grad], 1.0)
@@ -600,12 +734,13 @@ def main():
                 # still credited -- the number is throughput in "nominal 6ND" units, not hardware FLOPs.
                 tfl, m = mfu(n_real_step, dt, n_params, fwd_bwd=True)
                 peak_gb = torch.cuda.max_memory_allocated() / 2**30
+                pad_frac = 1.0 - n_pad_real / max(n_pad_slots, 1)   # fraction of padded-tensor slots that were padding
                 print(f"ep{ep} step {step}/{steps_total} loss {loss_step.item():.4f} | "
                       f"{tfl:.0f} TFLOP/s MFU {m:.0%} | {n_ex_step / dt:.2f} ex/s {n_real_step / dt:.0f} tok/s "
-                      f"({dt:.3f} s/step, {len(group)} micro) | peak {peak_gb:.1f} GB", flush=True)
+                      f"pad {pad_frac:.1%} ({dt:.3f} s/step, {len(group)} micro) | peak {peak_gb:.1f} GB", flush=True)
                 if not a.no_wandb:
                     wandb.log({"loss": loss_step.item(), "lr": sched.get_last_lr()[0], "mfu": m, "tflops": tfl,
-                               "ex_per_s": n_ex_step / dt, "tok_per_s": n_real_step / dt,
+                               "ex_per_s": n_ex_step / dt, "tok_per_s": n_real_step / dt, "pad_frac": pad_frac,
                                "peak_mem_gb": peak_gb}, step=step)
             if step % save_every == 0 and step:
                 save_ckpt(f"{a.save_dir}/step_{step}", step)

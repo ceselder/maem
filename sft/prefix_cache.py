@@ -82,6 +82,130 @@ def expand_cache_copy(cache, repeats):
     return new
 
 
+class PrefixGradientAccumulator:
+    """Share a differentiable prefix across an entire optimizer step.
+
+    Suffix backward passes end at detached cache leaves. ``accumulate`` saves their
+    gradients in fp32; ``backward`` applies the summed cache gradients to the original
+    prefix graph ONCE. This is the chain rule, not a frozen/detached-prefix objective.
+    It avoids both repeated prefix forwards and retain_graph/repeated prefix backwards.
+    Rebuild after every optimizer update. Floating-point summation order differs from
+    the repeated-prefix path, so bf16 gradients are not expected to be bit-identical.
+
+    The supported cache is the fork's DynamicCache (attention K/V and GDN conv/recurrent
+    states). Only expand COPIES of ``cache`` with ``expand_cache_copy`` for suffix calls.
+    DDP must have automatic reduction disabled for all suffix/prefix backwards, followed
+    by one explicit reduction of the completed parameter gradients (see below).
+    """
+
+    def __init__(self, cache):
+        self._pairs = []
+        self._sums = []
+        self._finished = False
+        tensors = {}
+
+        def detach(value):
+            if isinstance(value, torch.Tensor):
+                if id(value) not in tensors:
+                    leaf = value.detach().requires_grad_(value.requires_grad)
+                    tensors[id(value)] = leaf
+                    if value.requires_grad:
+                        self._pairs.append((value, leaf))
+                        self._sums.append(None)
+                return tensors[id(value)]
+            if isinstance(value, dict):
+                return {k: detach(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [detach(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(detach(v) for v in value)
+            return value
+
+        self.cache = copy.copy(cache)
+        self.cache.layers = []
+        for layer in cache.layers:
+            new = copy.copy(layer)
+            for name, value in vars(layer).items():
+                setattr(new, name, detach(value))
+            self.cache.layers.append(new)
+
+    def accumulate(self):
+        """Call after each suffix backward; no GPU-to-CPU synchronization."""
+        if self._finished:
+            raise RuntimeError("prefix gradients have already been consumed; build a new prefix")
+        for i, (_, leaf) in enumerate(self._pairs):
+            if leaf.grad is not None:
+                if self._sums[i] is None:
+                    # Keep double precision in CPU equivalence tests; accumulate bf16/fp16 in fp32.
+                    dtype = torch.float64 if leaf.dtype == torch.float64 else torch.float32
+                    self._sums[i] = leaf.grad.detach().to(dtype)
+                else:
+                    self._sums[i].add_(leaf.grad.detach())
+                leaf.grad = None
+
+    def backward(self):
+        """Propagate the accumulated cache gradients through the original prefix once."""
+        self.accumulate()
+        outputs, grads = [], []
+        for (original, _), grad in zip(self._pairs, self._sums):
+            if grad is not None:
+                outputs.append(original)
+                grads.append(grad.to(original.dtype))
+        if outputs:
+            torch.autograd.backward(outputs, grads)
+        self._finished = True
+        self.cache = None
+        self._pairs.clear()
+        self._sums.clear()
+
+
+def sync_accumulated_gradients(parameters, bucket_bytes=32 * 1024**2):
+    """Average completed local gradients once, after suffix AND prefix backwards.
+
+    Bounded-size buckets avoid allocating another full LoRA gradient vector. A global
+    presence mask handles locally unused parameters without dropping another rank's
+    contribution; globally unused parameters retain grad=None, as in DDP. Every rank
+    must pass the same ordered parameter list. Call before gradient clipping/Adam.
+    """
+    import torch.distributed as dist
+
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return
+    params = [p for p in parameters if p.requires_grad]
+    if not params:
+        return
+    comm_device = params[0].device if dist.get_backend() == "nccl" else torch.device("cpu")
+    present = torch.tensor([p.grad is not None for p in params], dtype=torch.int32, device=comm_device)
+    dist.all_reduce(present, op=dist.ReduceOp.MAX)
+    active = [p for p, used in zip(params, present.tolist()) if used]
+    world = dist.get_world_size()
+
+    def reduce(bucket):
+        if not bucket:
+            return
+        for p in bucket:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+        flat = torch.cat([p.grad.reshape(-1) for p in bucket]).to(comm_device)
+        dist.all_reduce(flat)
+        flat.div_(world)
+        flat = flat.to(bucket[0].device)
+        offset = 0
+        for p in bucket:
+            p.grad.copy_(flat[offset:offset + p.numel()].view_as(p))
+            offset += p.numel()
+
+    bucket, size = [], 0
+    for p in active:
+        nbytes = p.numel() * p.element_size()
+        if bucket and (size + nbytes > bucket_bytes or p.dtype != bucket[0].dtype or p.device != bucket[0].device):
+            reduce(bucket)
+            bucket, size = [], 0
+        bucket.append(p)
+        size += nbytes
+    reduce(bucket)
+
+
 def check_transformers():
     """Refuse stock transformers: it lacks the autograd-safe linear-attention cache writes + batch expansion."""
     import transformers
