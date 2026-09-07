@@ -20,6 +20,20 @@ heartbeat went stale before `final` exists (24h Modal cap / crash), resuming fro
 step_N via --init-adapter + --skip-steps (batch order is deterministic) + --wandb-id.
 Pause auto-resume: `touch /data/sft_mix/resume_paused` (global) or `<run>/resume_paused`.
 
+MULTI-NODE (`train_multinode`, modal.experimental.clustered): the SAME run on N containers x 8 GPUs = one torchrun
+job of world 8N, ~N x faster at the same effective batch (per-GPU micro-batch unchanged, --grad-accum 32/N).
+Cluster size / GPU / RDMA are decorator constants = deploy-time env (SFT_N_NODES=4, SFT_MN_GPU=B200:8, SFT_MN_RDMA=0:
+RDMA is allowlisted and this workspace lacks it -> NCCL over Modal's 50 Gbps TCP network); Modal requires the full GPU
+count of a node per container (":8"). ALWAYS deploy/run it through
+sft/modal_sft_multinode.py, which pins SFT_APP_NAME=maemm-sft-multinode (never the production single-node app):
+    SFT_N_NODES=4 modal deploy sft/modal_sft_multinode.py
+    modal run sft/modal_sft_multinode.py::run_cluster_check          # NCCL all-reduce across all nodes + volume read speed
+    modal run sft/modal_sft_multinode.py::launch_multinode --run-name R --data-dir /data/banks/B --extra-args "... --grad-accum 8"
+Rank-0 container owns run_meta/heartbeat/commits; torchrun global rank 0 writes ckpts + wandb (pretrain.py is_main).
+Auto-resume: `supervisor_multinode` (scheduled iff SFT_MULTINODE_SUPERVISOR=1) handles runs whose run_meta has
+n_nodes > 1; pause one with `<run>/multinode_resume_paused` (a multi-node run always carries `<run>/resume_paused`
+so the legacy single-node supervisor never resumes it as ONE node at a quarter of the effective batch).
+
 Needs Modal secrets `maemm-hf` (HF_TOKEN) and `maemm-wandb` (WANDB_API_KEY).
 """
 
@@ -28,6 +42,7 @@ from pathlib import Path
 import os
 
 import modal
+import modal.experimental  # clustered / get_cluster_info are NOT re-exported by `import modal`
 
 REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 
@@ -80,6 +95,7 @@ image = (
     .add_local_file(REPO / "sft" / "fp8.py", "/pmx/SL/fp8.py")            # --fp8-base (imported by pretrain.py)
     .add_local_file(REPO / "sft" / "fp8_eval.py", "/pmx/SL/fp8_eval.py")  # fp8 speed/fidelity harness (fp8_eval fn)
     .add_local_file(REPO / "sft" / "fp8_microbench.py", "/pmx/SL/fp8_microbench.py")  # fp8 GEMM/layer/profile bench
+    .add_local_file(REPO / "sft" / "ddp_check.py", "/pmx/SL/ddp_check.py")  # cluster_check torchrun target (multi-node NCCL probe)
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 
@@ -88,6 +104,17 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
 SFT_ROOT = "/data/sft_mix"
 STALE_HEARTBEAT_S = 30 * 60   # live legs touch+commit the heartbeat every <=5 min; 30 min = dead
 SPAWN_COOLDOWN_S = 3600       # never double-spawn while a fresh leg pulls image/model (~15-30 min)
+
+# ---- multi-node (modal.experimental.clustered): N containers x 8 GPUs = ONE torchrun job. Cluster size, GPU type and
+# RDMA are decorator constants -> deploy-time env. Modal: "clustered functions must use the full number of GPU devices
+# per node" (":8"), up to 64 devices per cluster; rdma=True = the 3,200 Gbps RoCE scale-out network (else 50 Gbps TCP).
+# rdma is allowlisted per workspace: safety-sahan gets PermissionDeniedError('RDMA is not supported on this workspace.')
+# (probed 2026-09-07), so the default is TCP; SFT_MN_RDMA=1 once Modal enables it. ----
+N_NODES = int(os.environ.get("SFT_N_NODES", "4"))
+MN_GPU = os.environ.get("SFT_MN_GPU", "B200:8")
+MN_RDMA = os.environ.get("SFT_MN_RDMA", "0") == "1"
+MN_PORT = 29500                                       # torchrun (static c10d) rendezvous port on the rank-0 container
+MN_RDZV_TIMEOUT_S = 3600                              # nodes reach torchrun at different times (per-node bank staging)
 
 
 VEC_BANK_FILES = (("vecs.f32", 4), ("vecs.f16", 2))   # (filename, bytes per element); same as pretrain.py
@@ -103,7 +130,7 @@ def _vec_bank_file(data_dir: str):
     raise AssertionError(f"bank incomplete: neither vecs.f32 nor vecs.f16 in {data_dir}")
 
 
-def _preflight(run_name: str, data_dir: str, n_ckpts: int, resume_from: str):
+def _preflight(run_name: str, data_dir: str, n_ckpts: int, resume_from: str, save_root: str = SFT_ROOT):
     """Shared guardrails + bank staging for train/smoke. Returns (save_dir, local_bank, d_model)."""
     import glob
     import json
@@ -128,7 +155,7 @@ def _preflight(run_name: str, data_dir: str, n_ckpts: int, resume_from: str):
     sys.path.insert(0, "/pmx/helpers")
     from mxf.config import D_MODEL, MODEL  # single source of truth (5120, Qwen/Qwen3.6-27B)
 
-    save_dir = f"{SFT_ROOT}/{run_name}"
+    save_dir = f"{save_root}/{run_name}"
     if os.path.exists(f"{save_dir}/final"):
         raise RuntimeError(f"{save_dir}/final exists — run complete; pick a new --run-name")
     prior = sorted(glob.glob(f"{save_dir}/step_*"))
@@ -198,6 +225,91 @@ def _stream(cmd, env, tag):
     return p.wait()
 
 
+def _start_committer(save_dir: str):
+    """Heartbeat + committer thread: touch <run>/heartbeat every 60s (supervisor aliveness signal, started BEFORE the
+    slow model load so fresh legs read as alive immediately) and vol.commit right after every new ckpt lands (else
+    every 300s) so saves are durable even if the container dies mid-run."""
+    import glob
+    import threading
+    import time
+
+    def _committer():
+        last_commit, last_ckpts = 0.0, -1
+        while True:
+            try:
+                with open(f"{save_dir}/heartbeat", "w") as f:
+                    f.write(str(time.time()))
+                n = len(glob.glob(f"{save_dir}/step_*")) + len(glob.glob(f"{save_dir}/final"))
+                if n != last_ckpts or time.time() - last_commit > 300:
+                    vol.commit()
+                    last_commit, last_ckpts = time.time(), n
+            except Exception as e:
+                print(f"[modal] heartbeat/commit failed: {e}", flush=True)
+            time.sleep(60)
+
+    threading.Thread(target=_committer, daemon=True).start()
+
+
+def _run_meta(save_dir: str, wandb_id: str, fresh: dict, leg: dict):
+    """run_meta.json = everything the supervisor needs to respawn this run faithfully. Written once on the first leg
+    (wandb id minted here so every leg logs to ONE wandb run); later legs only append to `legs`. Returns wandb_id."""
+    import json
+    import os
+    import secrets as pysecrets
+    import string
+    import time
+
+    meta_path = f"{save_dir}/run_meta.json"
+    if os.path.exists(meta_path):
+        meta = json.load(open(meta_path))
+        wandb_id = wandb_id or meta.get("wandb_id", "")
+    else:
+        wandb_id = wandb_id or "".join(
+            pysecrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+        meta = {**fresh, "wandb_id": wandb_id, "created": time.time(), "legs": []}
+    meta["legs"].append({"ts": time.time(), **leg})
+    json.dump(meta, open(meta_path, "w"), indent=2)
+    return wandb_id
+
+
+def _pretrain_argv(local_bank, save_dir, run_name, n_ckpts, epochs, wandb_id, batch_size, lr, max_seq,
+                   resume_from, skip_steps, extra_args):
+    """pretrain.py argv shared by train / train_multinode (extra_args whitespace-split, appended last: argparse last-wins)."""
+    argv = ["SL/pretrain.py", "--data-dir", local_bank, "--save-dir", save_dir, "--run-name", run_name,
+            "--n-ckpts", str(n_ckpts), "--epochs", str(epochs), "--wandb-id", wandb_id]
+    if batch_size:
+        argv += ["--batch-size", str(batch_size)]
+    if lr:
+        argv += ["--lr", str(lr)]
+    if max_seq:
+        argv += ["--max-seq", str(max_seq)]
+    if resume_from:
+        argv += ["--init-adapter", resume_from, "--skip-steps", str(skip_steps)]
+    if extra_args:
+        argv += extra_args.split()
+    return argv
+
+
+def _cluster():
+    """(rank, size, master_addr, cluster_id) of this container's modal.experimental cluster. container_ips are the
+    IPv6 addresses sorted by rank; the rank-0 container hosts the torchrun rendezvous."""
+    import modal.experimental
+
+    ci = modal.experimental.get_cluster_info()
+    return ci.rank, len(ci.container_ips), ci.container_ips[0], ci.cluster_id
+
+
+def _gpus_per_node(gpu_spec: str) -> int:
+    return int(gpu_spec.split(":")[1]) if ":" in gpu_spec else 1
+
+
+def _torchrun_multinode(rank: int, size: int, master: str, nproc: int):
+    """torchrun prefix for one node of a static (c10d) multi-node rendezvous on the rank-0 container. IPv6 master addr
+    is passed bare, as in Modal's own example (torchrun rsplits host:port on the last colon)."""
+    return ["torchrun", f"--nnodes={size}", f"--node_rank={rank}", f"--nproc_per_node={nproc}",
+            f"--master_addr={master}", f"--master_port={MN_PORT}", f"--rdzv_conf=timeout={MN_RDZV_TIMEOUT_S}"]
+
+
 @app.function(
     image=image,
     gpu=os.environ.get("SFT_GPU", "B200:8"),
@@ -219,81 +331,170 @@ def train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
     # whitespace-split, appended last (argparse last-wins), e.g. "--compile --log-steps 50".
     # resume_from/skip_steps/wandb_id: supervisor crash-resume — --init-adapter <ckpt> +
     # --skip-steps fast-forward through the deterministic batch order + same wandb run.
-    import glob
-    import json
     import os
-    import secrets as pysecrets
-    import string
-    import threading
-    import time
 
     if not data_dir.startswith("/"):
         data_dir = f"/data/{data_dir}"
     save_dir, local_bank, _ = _preflight(run_name, data_dir, n_ckpts, resume_from)
     os.makedirs(save_dir, exist_ok=True)
 
-    # ---- run_meta.json: everything the supervisor needs to respawn this run faithfully. Written
-    # once on the first leg (wandb id minted here so every leg logs to ONE wandb run). ----
-    meta_path = f"{save_dir}/run_meta.json"
-    if os.path.exists(meta_path):
-        meta = json.load(open(meta_path))
-        wandb_id = wandb_id or meta.get("wandb_id", "")
-    else:
-        wandb_id = wandb_id or "".join(
-            pysecrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-        meta = {"run_name": run_name, "data_dir": data_dir, "n_ckpts": n_ckpts, "epochs": epochs,
-                "batch_size": batch_size, "lr": lr, "max_seq": max_seq, "backend": backend,
-                "extra_args": extra_args, "wandb_id": wandb_id, "created": time.time(), "legs": []}
-    meta["legs"].append({"ts": time.time(), "resume_from": resume_from, "skip_steps": skip_steps})
-    json.dump(meta, open(meta_path, "w"), indent=2)
-
-    # ---- heartbeat + committer: touch <run>/heartbeat every 60s (supervisor aliveness signal,
-    # started BEFORE the slow model download so fresh legs read as alive immediately) and
-    # vol.commit right after every new ckpt lands (else every 300s) so saves are durable even if
-    # the container dies mid-run. ----
-    def _committer():
-        last_commit, last_ckpts = 0.0, -1
-        while True:
-            try:
-                with open(f"{save_dir}/heartbeat", "w") as f:
-                    f.write(str(time.time()))
-                n = len(glob.glob(f"{save_dir}/step_*")) + len(glob.glob(f"{save_dir}/final"))
-                if n != last_ckpts or time.time() - last_commit > 300:
-                    vol.commit()
-                    last_commit, last_ckpts = time.time(), n
-            except Exception as e:
-                print(f"[modal] heartbeat/commit failed: {e}", flush=True)
-            time.sleep(60)
-
-    threading.Thread(target=_committer, daemon=True).start()
+    wandb_id = _run_meta(save_dir, wandb_id,
+                         fresh={"run_name": run_name, "data_dir": data_dir, "n_ckpts": n_ckpts, "epochs": epochs,
+                                "batch_size": batch_size, "lr": lr, "max_seq": max_seq, "backend": backend,
+                                "extra_args": extra_args},
+                         leg={"resume_from": resume_from, "skip_steps": skip_steps})
+    _start_committer(save_dir)
     vol.commit()  # publish run_meta + heartbeat now: the supervisor must see this leg exists
 
-    cmd = [
-        "torchrun", "--standalone", "--nproc_per_node=8", "SL/pretrain.py",
-        "--data-dir", local_bank,
-        "--save-dir", save_dir,
-        "--run-name", run_name,
-        "--n-ckpts", str(n_ckpts),
-        "--epochs", str(epochs),
-        "--wandb-id", wandb_id,
-    ]
-    if batch_size:
-        cmd += ["--batch-size", str(batch_size)]
-    if lr:
-        cmd += ["--lr", str(lr)]
-    if max_seq:
-        cmd += ["--max-seq", str(max_seq)]
-    if resume_from:
-        cmd += ["--init-adapter", resume_from, "--skip-steps", str(skip_steps)]
-    if extra_args:
-        cmd += extra_args.split()
-
+    cmd = ["torchrun", "--standalone", "--nproc_per_node=8"] + _pretrain_argv(
+        local_bank, save_dir, run_name, n_ckpts, epochs, wandb_id, batch_size, lr, max_seq,
+        resume_from, skip_steps, extra_args)
     rc = _stream(cmd, _train_env(backend), "modal")
     vol.commit()
     if rc != 0:
         raise RuntimeError(f"torchrun exited rc={rc} (backend={backend}) — supervisor will resume")
     assert os.path.exists(f"{save_dir}/final"), "rc=0 but no final ckpt — trainer exited early?"
     print(f"[modal] SFT run {run_name} COMPLETE -> {save_dir}/final", flush=True)
+
+
+@app.function(
+    image=image,
+    gpu=MN_GPU,
+    volumes={"/data": vol},
+    secrets=[
+        modal.Secret.from_name("maemm-hf"),
+        modal.Secret.from_name("maemm-wandb"),
+    ],
+    timeout=86400,
+    ephemeral_disk=int(os.environ.get("SFT_DISK_GB", "600")) * 1024,   # EVERY node stages its own bank copy (_preflight)
+    memory=256 * 1024,
+)
+@modal.experimental.clustered(size=N_NODES, rdma=MN_RDMA)
+def train_multinode(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
+                    batch_size: int = 0, lr: float = 0.0, max_seq: int = 0,
+                    backend: str = "nccl", extra_args: str = "",
+                    resume_from: str = "", skip_steps: int = 0, wandb_id: str = "",
+                    n_nodes: int = N_NODES, save_root: str = SFT_ROOT):
+    """`train` across N_NODES containers x 8 GPUs = world 8*N_NODES, ONE torchrun DDP job (static c10d rendezvous on
+    the rank-0 container). Same args as `train` plus n_nodes (runtime guard: must equal the deployed cluster size,
+    SFT_N_NODES) and save_root (default /data/sft_mix; smoke tests point it at /tmp so nothing production-facing
+    sees them). Every container stages the bank + HF cache itself; ONLY the rank-0 container owns run_meta /
+    heartbeat / volume commits, and only its torchrun rank 0 writes ckpts + wandb (pretrain.py is_main = RANK 0).
+    Hold the effective batch by keeping the per-GPU micro-batch and passing --grad-accum 32/n_nodes in extra_args:
+    64 x 8 GPUs x 4 nodes x 8 accum = 16,384 = the 1-node 64 x 8 x 32. Same optimizer-step count + LR schedule;
+    pretrain.py shards records as i % world, so the example composition of each step differs from the 1-node run
+    (statistically equivalent, not bit-identical)."""
+    import os
+
+    rank, size, master, cluster_id = _cluster()
+    nproc = _gpus_per_node(MN_GPU)
+    world = size * nproc
+    tag = f"modal-mn{rank}/{size}"
+    assert size == n_nodes == N_NODES, f"cluster size {size} != n_nodes {n_nodes} / deployed SFT_N_NODES {N_NODES}"
+    is_leader = rank == 0
+    toks = extra_args.split()
+    accum = int(toks[toks.index("--grad-accum") + 1]) if "--grad-accum" in toks else 1
+    bs = batch_size or 64
+    print(f"[{tag}] cluster {cluster_id}: rank {rank}/{size}, rendezvous {master}:{MN_PORT}, {nproc} GPU/node -> "
+          f"world {world}; effective batch = {bs} x {world} x grad_accum {accum} = {bs * world * accum}", flush=True)
+
+    if not data_dir.startswith("/"):
+        data_dir = f"/data/{data_dir}"
+    # every node: HF cache check + bank -> container-local NVMe (same as the 1-node path, N copies)
+    save_dir, local_bank, _ = _preflight(run_name, data_dir, n_ckpts, resume_from, save_root=save_root)
+    os.makedirs(save_dir, exist_ok=True)
+
+    if is_leader:
+        wandb_id = _run_meta(save_dir, wandb_id,
+                             fresh={"run_name": run_name, "data_dir": data_dir, "n_ckpts": n_ckpts, "epochs": epochs,
+                                    "batch_size": batch_size, "lr": lr, "max_seq": max_seq, "backend": backend,
+                                    "extra_args": extra_args, "n_nodes": n_nodes, "gpu": MN_GPU, "rdma": MN_RDMA,
+                                    "save_root": save_root, "app_name": APP_NAME},
+                             leg={"resume_from": resume_from, "skip_steps": skip_steps, "cluster_id": cluster_id})
+        # The single-node supervisor (production deployment, older code) would respawn a stale multi-node run as ONE
+        # node carrying this run's --grad-accum -> 1/n_nodes of the effective batch. Its only per-run off switch is
+        # <run>/resume_paused, so every multi-node run carries it; supervisor_multinode pauses on
+        # <run>/multinode_resume_paused instead (see _supervise).
+        with open(f"{save_dir}/resume_paused", "w") as f:
+            f.write("multi-node run (modal_sft.train_multinode): the single-node supervisor must not resume it; "
+                    "pause the multi-node supervisor with <run>/multinode_resume_paused\n")
+        _start_committer(save_dir)
+        vol.commit()  # publish run_meta + heartbeat + marker now
+
+    cmd = _torchrun_multinode(rank, size, master, nproc) + _pretrain_argv(
+        local_bank, save_dir, run_name, n_ckpts, epochs, wandb_id, batch_size, lr, max_seq,
+        resume_from, skip_steps, extra_args)
+    env = _train_env(backend)
+    env.setdefault("NCCL_DEBUG", os.environ.get("SFT_NCCL_DEBUG", "WARN"))
+    rc = _stream(cmd, env, tag)
+    if is_leader:
+        vol.commit()
+    if rc != 0:
+        raise RuntimeError(f"[{tag}] torchrun exited rc={rc} (backend={backend}) — supervisor_multinode will resume")
+    if is_leader:
+        assert os.path.exists(f"{save_dir}/final"), "rc=0 but no final ckpt — trainer exited early?"
+        print(f"[{tag}] multi-node SFT run {run_name} COMPLETE -> {save_dir}/final", flush=True)
+    return {"rank": rank, "cluster_id": cluster_id, "rc": rc}
+
+
+@app.function(
+    image=image,
+    gpu=MN_GPU,
+    volumes={"/data": vol},
+    timeout=1800,
+    memory=64 * 1024,
+)
+@modal.experimental.clustered(size=N_NODES, rdma=MN_RDMA)
+def cluster_check(allreduce_mb: int = 1800, read_gb: float = 0.0,
+                  read_path: str = "/data/banks/realact_short_20m_all/vecs.f16"):
+    """Cheap multi-node probe (no model, no bank): prints the cluster info Modal hands each container, runs
+    sft/ddp_check.py under the SAME torchrun rendezvous train_multinode uses (one NCCL group of 8*N ranks; all-reduce
+    time at LoRA-grad size = the per-step cross-node comm cost) with NCCL INIT/NET logging (shows IB/RoCE vs Socket),
+    and optionally reads read_gb GB of read_path on EVERY node concurrently = the bank-staging throughput a real run
+    will see. Returns rank 0's dict."""
+    import os
+    import socket
+    import subprocess
+    import time
+
+    import modal.experimental
+
+    ci = modal.experimental.get_cluster_info()
+    rank, size, master, cluster_id = _cluster()
+    nproc = _gpus_per_node(MN_GPU)
+    tag = f"cluster-check r{rank}/{size}"
+    print(f"[{tag}] cluster {cluster_id} host={socket.gethostname()} ips={ci.container_ips} "
+          f"ipv4={ci.container_ipv4_ips} fabric_ids={ci.fabric_ids} rdma_requested={MN_RDMA}", flush=True)
+    print(f"[{tag}] " + subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout.strip()
+          .replace("\n", f"\n[{tag}] "), flush=True)
+    ib = sorted(os.listdir("/sys/class/infiniband")) if os.path.isdir("/sys/class/infiniband") else []
+    print(f"[{tag}] /sys/class/infiniband: {ib or 'none'}; NCCL env: "
+          f"{ {k: v for k, v in os.environ.items() if k.startswith('NCCL')} }", flush=True)
+
+    env = _train_env("nccl")
+    env["NCCL_DEBUG"], env["NCCL_DEBUG_SUBSYS"] = "INFO", "INIT,NET"
+    cmd = _torchrun_multinode(rank, size, master, nproc) + ["SL/ddp_check.py", "--allreduce-mb", str(allreduce_mb)]
+    t0 = time.time()
+    rc = _stream(cmd, env, tag)
+    print(f"[{tag}] torchrun rc={rc} ({time.time() - t0:.0f}s incl. rendezvous)", flush=True)
+    if rc != 0:
+        raise RuntimeError(f"[{tag}] ddp_check exited rc={rc}")
+
+    out = {"rank": rank, "cluster_id": cluster_id, "nodes": size, "gpus_per_node": nproc, "rc": rc}
+    if read_gb > 0:
+        n, chunk, done = int(read_gb * 2**30), 64 * 2**20, 0
+        t0 = time.time()
+        with open(read_path, "rb") as f:
+            while done < n:
+                b = f.read(min(chunk, n - done))
+                if not b:
+                    break
+                done += len(b)
+        dt = time.time() - t0
+        out["volume_read_gbps"] = done / dt / 1e9
+        print(f"[{tag}] volume read {done / 2**30:.1f} GiB of {read_path} in {dt:.0f}s = {done / dt / 1e9:.2f} GB/s "
+              f"(all {size} nodes reading concurrently)", flush=True)
+    return out
 
 
 @app.function(
@@ -490,54 +691,75 @@ def prewarm():
 # --skip-steps N+1 (step_N is saved after batch N of the deterministic order) + the same wandb id.
 # No step ckpts yet -> clean fresh respawn. Unlike the RL supervisor this is fully generic across
 # N parallel runs: per-run heartbeat/state files, nothing hardcoded. ----
-@app.function(schedule=modal.Period(minutes=20) if os.environ.get("SFT_SUPERVISOR", "1") == "1" else None,
-              volumes={"/data": vol}, timeout=600)   # SFT_SUPERVISOR=0 at deploy: a second deployment must not double-resume runs
-def supervisor():
+def _supervise(multinode: bool):
+    """One supervisor pass. multinode=False: single-node runs (run_meta without n_nodes > 1) -> `train`, pause marker
+    <run>/resume_paused. multinode=True: runs with run_meta n_nodes > 1 -> `train_multinode` (same cluster size as
+    deployed), pause marker <run>/multinode_resume_paused (<run>/resume_paused is the legacy-supervisor blocker every
+    multi-node run carries -- see train_multinode). The global /data/sft_mix/resume_paused pauses both."""
     import glob
     import json
     import os
     import time
 
+    who, fn = ("supervisor-mn", "train_multinode") if multinode else ("supervisor", "train")
     vol.reload()
     if os.path.exists(f"{SFT_ROOT}/resume_paused"):
-        print(f"[supervisor] auto-resume PAUSED ({SFT_ROOT}/resume_paused present) — no spawns", flush=True)
+        print(f"[{who}] auto-resume PAUSED ({SFT_ROOT}/resume_paused present) — no spawns", flush=True)
         return
     for meta_path in sorted(glob.glob(f"{SFT_ROOT}/*/run_meta.json")):
         run_dir = os.path.dirname(meta_path)
         run = os.path.basename(run_dir)
+        meta = json.load(open(meta_path))
+        if (meta.get("n_nodes", 1) > 1) != multinode:
+            continue   # the other supervisor's run
         if os.path.exists(f"{run_dir}/final"):
-            print(f"[supervisor] {run}: COMPLETE", flush=True)
+            print(f"[{who}] {run}: COMPLETE", flush=True)
             continue
-        if os.path.exists(f"{run_dir}/resume_paused"):
-            print(f"[supervisor] {run}: paused ({run}/resume_paused present)", flush=True)
+        pause = "multinode_resume_paused" if multinode else "resume_paused"
+        if os.path.exists(f"{run_dir}/{pause}"):
+            print(f"[{who}] {run}: paused ({run}/{pause} present)", flush=True)
             continue
         hb = f"{run_dir}/heartbeat"
         age = time.time() - (os.path.getmtime(hb) if os.path.exists(hb) else os.path.getmtime(meta_path))
         if age < STALE_HEARTBEAT_S:
-            print(f"[supervisor] {run}: alive (heartbeat {age / 60:.0f} min old)", flush=True)
+            print(f"[{who}] {run}: alive (heartbeat {age / 60:.0f} min old)", flush=True)
             continue
         st_path = f"{run_dir}/resume_state.json"
         st = json.load(open(st_path)) if os.path.exists(st_path) else {}
         if time.time() - st.get("last_spawn_ts", 0) < SPAWN_COOLDOWN_S:
-            print(f"[supervisor] {run}: stale but in post-spawn cooldown ({st.get('call')})", flush=True)
+            print(f"[{who}] {run}: stale but in post-spawn cooldown ({st.get('call')})", flush=True)
             continue
-        meta = json.load(open(meta_path))
         steps = sorted(int(p.rsplit("_", 1)[-1]) for p in glob.glob(f"{run_dir}/step_*")
                        if p.rsplit("_", 1)[-1].isdigit())
         resume_from = f"{run_dir}/step_{steps[-1]}" if steps else ""
         skip = steps[-1] + 1 if steps else 0  # step_N lands after batch N -> skip batches 0..N
-        print(f"[supervisor] {run}: DEAD (heartbeat {age / 60:.0f} min old) — respawning "
+        print(f"[{who}] {run}: DEAD (heartbeat {age / 60:.0f} min old) — respawning "
               f"{'from ' + resume_from + f' skip={skip}' if steps else 'FRESH (no ckpts yet)'}", flush=True)
-        call = modal.Function.from_name(APP_NAME, "train").spawn(
+        kwargs = dict(
             run_name=meta["run_name"], data_dir=meta["data_dir"], n_ckpts=meta["n_ckpts"],
             epochs=meta.get("epochs", 1), batch_size=meta.get("batch_size", 0),
             lr=meta.get("lr", 0.0), max_seq=meta.get("max_seq", 0),
             backend=meta.get("backend", "nccl"), extra_args=meta.get("extra_args", ""),
             resume_from=resume_from, skip_steps=skip, wandb_id=meta.get("wandb_id", ""))
+        if multinode:
+            kwargs.update(n_nodes=meta["n_nodes"], save_root=meta.get("save_root", SFT_ROOT))
+        call = modal.Function.from_name(APP_NAME, fn).spawn(**kwargs)
         json.dump({"last_spawn_ts": time.time(), "call": call.object_id,
                    "from_step": steps[-1] if steps else -1}, open(st_path, "w"))
         vol.commit()
-        print(f"[supervisor] {run}: resume leg spawned {call.object_id}", flush=True)
+        print(f"[{who}] {run}: resume leg spawned {call.object_id} ({fn})", flush=True)
+
+
+@app.function(schedule=modal.Period(minutes=20) if os.environ.get("SFT_SUPERVISOR", "1") == "1" else None,
+              volumes={"/data": vol}, timeout=600)   # SFT_SUPERVISOR=0 at deploy: a second deployment must not double-resume runs
+def supervisor():
+    _supervise(multinode=False)
+
+
+@app.function(schedule=modal.Period(minutes=20) if os.environ.get("SFT_MULTINODE_SUPERVISOR", "0") == "1" else None,
+              volumes={"/data": vol}, timeout=600)   # scheduled only in the multi-node deployment (sft/modal_sft_multinode.py)
+def supervisor_multinode():
+    _supervise(multinode=True)
 
 
 @app.local_entrypoint()
@@ -561,6 +783,44 @@ def run_train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
     train.remote(run_name=run_name, data_dir=data_dir, n_ckpts=n_ckpts, epochs=epochs,
                  batch_size=batch_size, lr=lr, max_seq=max_seq, backend=backend,
                  extra_args=extra_args)
+
+
+@app.local_entrypoint()
+def launch_multinode(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
+                     batch_size: int = 0, lr: float = 0.0, max_seq: int = 0,
+                     backend: str = "nccl", extra_args: str = "", n_nodes: int = N_NODES, save_root: str = SFT_ROOT):
+    """Spawn one multi-node SFT run on the DEPLOYED cluster app (`SFT_N_NODES=<n> modal deploy
+    sft/modal_sft_multinode.py` first). Pass --grad-accum <32 / n_nodes> in extra_args to keep the effective batch."""
+    assert n_nodes == N_NODES, f"n_nodes {n_nodes} != SFT_N_NODES {N_NODES} this file was loaded with"
+    assert APP_NAME != "maemm-sft-8xb200", "multi-node launches go through sft/modal_sft_multinode.py, never the production app"
+    call = modal.Function.from_name(APP_NAME, "train_multinode").spawn(
+        run_name=run_name, data_dir=data_dir, n_ckpts=n_ckpts, epochs=epochs,
+        batch_size=batch_size, lr=lr, max_seq=max_seq, backend=backend, extra_args=extra_args,
+        n_nodes=n_nodes, save_root=save_root)
+    print(f"spawned {n_nodes}-node SFT run {run_name!r} on bank {data_dir}: {call.object_id}")
+    print(f"logs:  modal app logs {APP_NAME}   |   ckpts: {save_root}/{run_name}/step_*")
+
+
+@app.local_entrypoint()
+def run_train_multinode(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
+                        batch_size: int = 0, lr: float = 0.0, max_seq: int = 0,
+                        backend: str = "nccl", extra_args: str = "", n_nodes: int = N_NODES, save_root: str = SFT_ROOT):
+    """Attached multi-node run (ephemeral app, live logs of every node; containers exit with the call). Smoke recipe:
+    --data-dir /data/banks/realact_short_smoke3 --n-ckpts 2 --batch-size 8 --save-root /tmp/mn_smoke
+    --extra-args "--no-wandb --prefix-cache --grad-ckpt 0 --autocast-bf16 --log-steps 1 --grad-accum 1"."""
+    assert n_nodes == N_NODES, f"n_nodes {n_nodes} != SFT_N_NODES {N_NODES} this file was loaded with"
+    assert APP_NAME != "maemm-sft-8xb200", "multi-node launches go through sft/modal_sft_multinode.py, never the production app"
+    print(train_multinode.remote(run_name=run_name, data_dir=data_dir, n_ckpts=n_ckpts, epochs=epochs,
+                                 batch_size=batch_size, lr=lr, max_seq=max_seq, backend=backend,
+                                 extra_args=extra_args, n_nodes=n_nodes, save_root=save_root))
+
+
+@app.local_entrypoint()
+def run_cluster_check(allreduce_mb: int = 1800, read_gb: float = 0.0,
+                      read_path: str = "/data/banks/realact_short_20m_all/vecs.f16"):
+    """Attached multi-node probe (ephemeral app; no deploy needed): cluster info + NCCL all-reduce across all nodes."""
+    assert APP_NAME != "maemm-sft-8xb200", "run this through sft/modal_sft_multinode.py"
+    print(cluster_check.remote(allreduce_mb=allreduce_mb, read_gb=read_gb, read_path=read_path))
 
 
 @app.local_entrypoint()
