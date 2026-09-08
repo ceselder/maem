@@ -118,10 +118,48 @@ composition is identical on all ranks; `--save-examples` counts examples as `bat
   AdamW step params rel 3e-5; kv-head replication (1 kv head, TP-2) all OK.
 * `sft/tp_exactness.py` (8xB200, real 27B, same DP-dealt micro-batch window): see section 9.
 
-## 9. Measured (8xB200) -- filled in by the run report
+## 9. Measured (8xB200, Modal, torch 2.10 / fla 0.5.2 / transformers fork e52940e; tiny bank replicated to 132k rows,
+targets 8-57 tokens, legacy length-bucket composition, `--prefix-cache --prefix-share-step --pad-multiple 1`)
 
-See `sft/results/tp_bench.json` / the report for: exactness (step-0 loss diff, gradient cosine, 20-step trace) and
-throughput (mb 256x2, 512x1, 128x4) vs the FSDP2 baseline (641 ex/s, 272-283 TFLOP/s per GPU, 140 GB).
+Throughput (`sft/results/tp_bench_eff512.json`, `tp_bench_eff4096.json`; bench = 6-8 logged steps after a 3-4 min step 0
+that JIT-compiles / autotunes the fla + Triton kernels in BOTH paths; median of the steps >= 2):
+
+| config | examples / step | s / step (median) | ex/s (node) | TFLOP/s per GPU | peak GB / rank |
+|---|---|---|---|---|---|
+| FSDP2 mb 64 x ga 8 (production, `--fsdp-prefetch 2`) | 4,096 | 6.46 | **629** (78.6 / rank) | 267 | 138 |
+| TP-8 mb 512 x ga 8 | 4,096 | 5.77 (5.0-5.9 once warm) | **696** (711-814 warm) | 281-362 | **166.7** |
+| TP-8 mb 256 x ga 16 | 4,096 | 6.49 | 607 | 251-291 | 112 |
+| TP-8 mb 512 x ga 8, eager HF norm (`--tp-fused-norm 0`) | 4,096 | OOM | -- | -- | > 178 |
+| TP-8 mb 512 x ga 1 | 512 | 1.33 (0.9-2.3, tokens 7-17k) | 386 | 165-197 | 154 |
+| TP-8 mb 256 x ga 2 | 512 | 2.35 | 223 | ~100 | 112 |
+| TP-8 mb 128 x ga 4 | 512 | 2.49 | 218 | ~90 | 85 |
+
+At effective batch 4,096 TP-8 with mb 512 is 1.1x (median) to 1.3x (warm steps) the FSDP2 baseline and mb 256 is 0.97x;
+the eff-512 rows show the per-step fixed cost (prefix fwd+bwd at B=1, optimizer over 54 GB, ~0.4 s) dominating small
+steps. Per-token marginal cost at mb 512 is ~0.13 s per 1k suffix tokens per GPU (~155-200 TFLOP/s).
+
+Profile of one mb-512 micro-batch step (`--profile-step 3`, torch.profiler, self device time; `sft/results/tp_bench_eff4096.json`
+notes): GPU busy ~4.5 s of a ~5.8 s unprofiled step (77%; the rest is CPU launch overhead -- fla's Triton launchers cost
+1-6 ms CPU per call, 432 GDN backward calls + 1,159 norm calls per step). Of the GPU time: **GEMMs 29%** (aten::mm 1.31 s
+for 1.83 PFLOP per GPU = ~1.4 PFLOP/s, i.e. the matmuls themselves run at ~60% of B200 peak), **NCCL all-reduce 17%**
+(2,586 calls x 293 us for ~116 MB = ~400 GB/s algbw, not overlapped), **fla GDN chunk kernels 15%**, **depthwise conv1d
+torch fallback 10%** (the `causal_conv1d` CUDA package is not installed: 432 x 0.3 ms fwd + 0.5 ms bwd), elementwise
+glue (copy_/add_/mul/sum: 70k launches) ~22%, sdpa mem-efficient attention backward 3%, fused RMSNorm 3%.
+So the TP step is NOT GEMM-bound: the same non-GEMM work that made FSDP2 launch-bound at 1,350 tokens/rank is still 70%
+of the GPU time at 11k tokens/rank, and the CPU cannot feed the GPU faster than ~77%.
+
+Memory at mb 512 (11-18k suffix tokens; `[mem]` attribution at the within-step peak, 166.7 GB): MLP activations 18 GB,
+fused-norm saved inputs 13.6 GB, residual adds (the next norm's input) 21 GB, fla `chunk_gated_delta_rule_fwd_h` h-states
+9 GB, expanded fp32 recurrent states (`batch_repeat_interleave`) 9 GB, GDN `apply_mask_to_padding_states` copies 8 GB,
+GDN gated-norm fp32 upcasts ~10 GB, conv 2.4 GB, l2norm 2.4 GB, head ~3 GB; static (bf16 params 6.8 + fp32 masters,
+grads, Adam 54) ~61 GB. The eager HF norm adds ~50 GB and OOMs. mb 512 has no headroom for the longest length buckets
+(512 x 57 tokens = 29k tokens would need ~230 GB) -> production must use mb 256 (or `--length-bucket`/a token cap).
+
+Exactness on the real 27B (`sft/tp_exactness.py`, `sft/results/tp_exactness_*.json`; same DP-dealt window, mb 32/rank =
+TP mb 256, DP-emulating loss normalisation): see the run report for the FSDP-vs-FSDP noise floor and the two TP variants.
+First run (TP fused norm vs FSDP2): step-0 loss 5.6099 vs 5.6046 (|d| 5.3e-3), grad norm 77.8 vs 76.6, gradient
+global cos 0.9941 (794/851 params below 0.999; worst 0.93 on 5120-element input_layernorm weights whose gradient is a
+cancelling sum), 20-step traces: mean |d loss| 0.18 with one 2.1 spike at step 6 (TP gnorm 224 vs FSDP 5).
 
 ## 10. Risks / not done
 
