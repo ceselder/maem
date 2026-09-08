@@ -781,7 +781,8 @@ def run_fullft_smoke(args: str = ""):
     ephemeral_disk=600 * 1024,   # the fp32 reference gradient dump is 108 GB (Modal minimum for the knob is 512 GiB)
 )
 def tp_exactness(data_dir: str = "/data/banks/realact_short_smoke3", n_records: int = 8192, batch_size: int = 32,
-                 steps: int = 20, lr: float = 1e-5, max_seq: int = 160, unit_test: bool = True) -> dict:
+                 steps: int = 20, lr: float = 1e-5, max_seq: int = 160, unit_test: bool = True,
+                 legs: str = "fsdp,fsdp-rerun,tp,tp-nofused") -> dict:
     """TP-8 vs FSDP2 exactness on the real 27B (sft/tp_exactness.py): two world-8 torchruns in ONE container over the same
     DP-dealt micro-batch window of the (tiny) bank -- FSDP2 first (dumps fp32 reference grads + a `steps`-step loss
     trace), then TP-8 (gathers its grads, compares, runs the same trace). Optionally runs the TP-2 unit test first
@@ -818,9 +819,12 @@ def tp_exactness(data_dir: str = "/data/banks/realact_short_smoke3", n_records: 
             results["rc"][f"unit_{tag_}"] = rc
     # four world-8 legs over the SAME window: fsdp (reference dump + trace), fsdp again (noise floor: compare vs the dump),
     # tp with the fused norm (production), tp with HF's eager norm (isolates the fused-norm contribution)
-    legs = [("fsdp", []), ("fsdp-rerun", ["--compare-only", "1", "--tag", "fsdp-rerun"]),
-            ("tp", ["--fused-norm", "1"]), ("tp-nofused", ["--fused-norm", "0", "--tag", "tp-nofused"])]
-    for tag_, extra_ in legs:
+    all_legs = {"fsdp": [], "fsdp-rerun": ["--compare-only", "1", "--tag", "fsdp-rerun"],
+                "tp": ["--fused-norm", "1"], "tp-nofused": ["--fused-norm", "0", "--tag", "tp-nofused"],
+                "tp-fp32reduce": ["--fused-norm", "1", "--reduce-fp32", "1", "--tag", "tp-fp32reduce"],
+                "tp-nofused-fp32reduce": ["--fused-norm", "0", "--reduce-fp32", "1", "--tag", "tp-nofused-fp32reduce"]}
+    leg_list = [(t.strip(), all_legs[t.strip()]) for t in legs.split(",") if t.strip()]
+    for tag_, extra_ in leg_list:
         mode = "fsdp" if tag_.startswith("fsdp") else "tp"
         cmd = ["torchrun", "--standalone", "--nproc_per_node=8", "SL/tp_exactness.py", "--mode", mode, "--data-dir", bank,
                "--out", out, "--batch-size", str(batch_size), "--steps", str(steps), "--lr", str(lr), "--max-seq", str(max_seq)] + extra_
@@ -833,7 +837,7 @@ def tp_exactness(data_dir: str = "/data/banks/realact_short_smoke3", n_records: 
             print("[tpx] over 60 min; stopping after this leg", flush=True)
             break
     results["summaries"] = {}
-    for tag_ in ("fsdp-rerun", "tp", "tp-nofused"):
+    for tag_ in [t for t, _ in leg_list if t != "fsdp"]:
         fn = f"{out}/{tag_}_exactness.json"
         if os.path.exists(fn):
             r = json.load(open(fn))

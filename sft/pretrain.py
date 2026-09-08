@@ -573,6 +573,9 @@ def main():
                          "slice of every matmul, so --batch-size is the NODE micro-batch (effective batch = batch-size x grad-accum) "
                          "and every rank loads the whole bank. fp32 masters + AdamW for the local shard, bf16 compute, full HF "
                          "checkpoints exactly as the FSDP2 path. Works with --prefix-cache --prefix-share-step --pad-multiple 1.")
+    ap.add_argument("--tp-reduce-fp32", type=int, default=0,
+                    help="--tp: 1 = all-reduce the row-parallel outputs / column-parallel input grads in fp32 (exact sums; the bf16 "
+                         "default lets NCCL accumulate the tp partial GEMMs in bf16 = extra rounding vs the full model) at 2x comm.")
     ap.add_argument("--tp-fused-norm", type=int, default=1,
                     help="--tp: 1 = fla's fused Triton RMSNorm for the (replicated) input/post-attention/final norms (same fp32 math, "
                          "saves the bf16 input instead of ~4 fp32 copies); 0 = HF's eager norm.")
@@ -673,7 +676,8 @@ def main():
             if (a.fsdp_keep_unsharded or a.fsdp_prefetch) and is_main:
                 print("[tp] --fsdp-keep-unsharded / --fsdp-prefetch ignored under --tp (no FSDP)", flush=True)
             tpm = TPM.shard_model_tp(model, a.tp, device, log=print if is_main else (lambda *x, **k: None),
-                                     fused_norm=bool(a.tp_fused_norm))
+                                     fused_norm=bool(a.tp_fused_norm),
+                                     reduce_dtype=torch.float32 if a.tp_reduce_fp32 else None)
             master_params = tpm.build_masters()
             model.no_sync = FT.FSDPNoSync()   # pretrain.py calls ddp.no_sync() for grad accumulation: a no-op here too
         else:

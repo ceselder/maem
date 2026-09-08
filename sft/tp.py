@@ -46,6 +46,23 @@ from torch import nn
 # ---------------------------------------------------------------------------------------------------------------
 # collectives as autograd functions (Megatron's f / g)
 # ---------------------------------------------------------------------------------------------------------------
+# dtype of the activation all-reduces (row-parallel outputs in the forward, column-parallel input grads in the backward).
+# None = the tensor's own dtype (bf16: the tp partial sums are each rounded to bf16 and NCCL accumulates in bf16 = up to
+# tp-1 extra roundings per output element vs the single-GEMM full model). torch.float32 = cast, reduce, cast back: exact
+# summation at 2x the communication volume (shard_model_tp(reduce_dtype=...) / pretrain.py --tp-reduce-fp32).
+REDUCE_DTYPE = None
+
+
+def _all_reduce_sum(x, group):
+    if REDUCE_DTYPE is not None and x.dtype != REDUCE_DTYPE:
+        y = x.to(REDUCE_DTYPE)
+        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=group)
+        return y.to(x.dtype)
+    y = x.contiguous().clone()
+    dist.all_reduce(y, op=dist.ReduceOp.SUM, group=group)
+    return y
+
+
 class _CopyToTP(torch.autograd.Function):
     """Identity in the forward; all-reduce (sum) of the gradient in the backward. Marks the input of a column-parallel
     region: every rank consumes the replicated activation, each produces a partial input-gradient."""
@@ -57,9 +74,7 @@ class _CopyToTP(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g):
-        g = g.contiguous()
-        dist.all_reduce(g, op=dist.ReduceOp.SUM, group=ctx.group)
-        return g, None
+        return _all_reduce_sum(g, ctx.group), None
 
 
 class _ReduceFromTP(torch.autograd.Function):
@@ -68,9 +83,7 @@ class _ReduceFromTP(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, group):
-        y = x.contiguous().clone()
-        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=group)
-        return y
+        return _all_reduce_sum(x, group)
 
     @staticmethod
     def backward(ctx, g):
@@ -300,10 +313,13 @@ def install_fused_rmsnorm(norm_modules):
     return undo
 
 
-def shard_model_tp(model, tp, device, log=print, fused_norm=True, group=None):
+def shard_model_tp(model, tp, device, log=print, fused_norm=True, group=None, reduce_dtype=None):
     """In-place: shard a loaded (bf16) Qwen3_5ForCausalLM over `tp` ranks (== dist world size unless `group` is given),
     install the TP collectives, the vocab-parallel embedding / LM head + parallel cross-entropy, and (GPU + fla) fused
-    RMSNorms. Returns a TPModel whose `build_masters()` gives the fp32 optimizer params."""
+    RMSNorms. reduce_dtype: see REDUCE_DTYPE (None = bf16 activation all-reduces, torch.float32 = exact sums at 2x comm).
+    Returns a TPModel whose `build_masters()` gives the fp32 optimizer params."""
+    global REDUCE_DTYPE
+    REDUCE_DTYPE = reduce_dtype
     if group is None:
         group = dist.group.WORLD
     world = dist.get_world_size(group)
@@ -459,7 +475,8 @@ def shard_model_tp(model, tp, device, log=print, fused_norm=True, group=None):
            if str(device).startswith("cuda") else "")
     log(f"[tp] sharded {len(layers)} layers ({n_gdn} GDN + {n_attn} attention) + embed/head over tp={tp} in {time.time() - t0:.0f}s | "
         f"{n_full / 1e9:.2f}B params, {n_local / 1e9:.3f}B local per rank | kv heads {Hkv} "
-        f"{'sharded' if Hkv % tp == 0 else f'replicated x{tp // Hkv}'} | fused RMSNorm {'on' if fused else 'off'} | {mem}")
+        f"{'sharded' if Hkv % tp == 0 else f'replicated x{tp // Hkv}'} | fused RMSNorm {'on' if fused else 'off'} | "
+        f"activation all-reduce dtype {'native (bf16)' if reduce_dtype is None else str(reduce_dtype).split('.')[-1]} | {mem}")
     tpm.fused_norm = fused
     return tpm
 

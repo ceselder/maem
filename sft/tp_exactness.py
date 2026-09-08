@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--max-seq", type=int, default=160)
     ap.add_argument("--dump-grads", type=int, default=1)
     ap.add_argument("--fused-norm", type=int, default=1)
+    ap.add_argument("--reduce-fp32", type=int, default=0, help="tp mode: fp32 activation all-reduces (tp.REDUCE_DTYPE)")
     ap.add_argument("--compare-only", type=int, default=0,
                     help="fsdp mode: compare this run's step-0 grads with the existing dump instead of writing one (FSDP-vs-FSDP "
                          "noise floor: fla atomics / nondeterministic reductions)")
@@ -133,7 +134,8 @@ def main():
         opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.0)
         tpm = None
     else:
-        tpm = TP.shard_model_tp(model, world, device, log=log, fused_norm=bool(a.fused_norm))
+        tpm = TP.shard_model_tp(model, world, device, log=log, fused_norm=bool(a.fused_norm),
+                                reduce_dtype=torch.float32 if a.reduce_fp32 else None)
         params = tpm.build_masters()
         opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.0)
         model.no_sync = FT.FSDPNoSync()
@@ -209,7 +211,7 @@ def main():
             if k == 0 and a.dump_grads:
                 gdir = f"{a.out}/ref_grads"
                 compare = compare_with_dump(gdir, ((name, TP.gathered_grads_one(tpm, name, m, spec)) for name, p, m, spec in tpm.masters),
-                                            device, is_main, log, "tp" + ("" if a.fused_norm else "-nofused"))
+                                            device, is_main, log, tag)
             gn = tpm.clip_grad_norm(1.0)
         opt.step(); opt.zero_grad()
         if tpm is not None:
