@@ -706,8 +706,8 @@ def fullft_bench(data_dir: str, configs: str = "32x64;64x32;128x16", n_records: 
         summ = {}
         if meas:
             # --tp N: every rank runs the same examples (no data parallelism) -> examples/step = B * GA, not 8 * B * GA
-            tp_m = re.search(r"--tp\s+(\d+)", common + " " + extra)
-            dp = 1 if (tp_m and int(tp_m[1]) > 0) else 8
+            tp_all = re.findall(r"--tp\s+(\d+)", common + " " + extra)   # argparse last-wins: extra may override common
+            dp = 1 if (tp_all and int(tp_all[-1]) > 0) else 8
             ex_per_step = dp * B * GA
             mean_dt = sum(s["dt"] for s in meas) / len(meas)
             summ = dict(n_measured=len(meas), mean_dt=mean_dt, median_dt=sorted(s["dt"] for s in meas)[len(meas) // 2],
@@ -715,9 +715,10 @@ def fullft_bench(data_dir: str, configs: str = "32x64;64x32;128x16", n_records: 
                         mean_tok_s=sum(s["tok_s"] for s in meas) / len(meas),
                         mean_mfu=sum(s["mfu"] for s in meas) / len(meas), mean_pad=sum(s["pad_frac"] for s in meas) / len(meas),
                         peak_gb=max(s["peak_gb"] for s in steps))
-        tp_m = re.search(r"--tp\s+(\d+)", common + " " + extra)
-        res = dict(tag=tag, batch_size=B, grad_accum=GA, eff_batch=(1 if (tp_m and int(tp_m[1]) > 0) else 8) * B * GA,
-                   tp=int(tp_m[1]) if tp_m else 0, extra=extra, cmd=" ".join(cmd),
+        tp_all = re.findall(r"--tp\s+(\d+)", common + " " + extra)
+        tp_deg = int(tp_all[-1]) if tp_all else 0
+        res = dict(tag=tag, batch_size=B, grad_accum=GA, eff_batch=(1 if tp_deg > 0 else 8) * B * GA,
+                   tp=tp_deg, extra=extra, cmd=" ".join(cmd),
                    rc=p.returncode, stopped_by_bench=stopped, oom=oom, wall_s=time.time() - t0,
                    gpu_mem_used_after_mib=used, steps=steps, notes=notes, summary=summ)
         print(f"[bench {tag}] done: rc={p.returncode} stopped={stopped} oom={oom} wall={res['wall_s']:.0f}s "
