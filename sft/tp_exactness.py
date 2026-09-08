@@ -95,6 +95,9 @@ def main():
                     help="fsdp mode: compare this run's step-0 grads with the existing dump instead of writing one (FSDP-vs-FSDP "
                          "noise floor: fla atomics / nondeterministic reductions)")
     ap.add_argument("--tag", default="", help="suffix for the trace / result file names (default: the mode)")
+    ap.add_argument("--split", type=int, default=1,
+                    help="fsdp mode: run each rank's micro-batch as N token-weighted halves (same objective, different GEMM "
+                         "shapes -> the bf16 re-rounding noise floor a re-implementation such as TP must be judged against)")
     a = ap.parse_args()
     tag = a.tag or a.mode
 
@@ -152,12 +155,26 @@ def main():
         shared = PrefixGradientAccumulator(pc.run_prefix(), extra_outputs=[pc.pop_prefix_logits()])
         if a.mode == "fsdp":
             targets, vmat = dp_batch(rank, k)
-            out = pc.forward(vmat, targets, prefix_cache=shared.cache)
-            out.loss.backward()
-            shared.accumulate()
-            loss_local = out.loss.detach().float()
-            n_tok = torch.tensor(float(out.n_target_tokens), device=device)
-            del out
+            if a.split > 1:
+                n_tot = sum(len(t) for t in targets)
+                loss_local = torch.zeros((), device=device)
+                step_ = -(-len(targets) // a.split)
+                for s0 in range(0, len(targets), step_):
+                    sl = slice(s0, s0 + step_)
+                    out = pc.forward(vmat[sl], targets[sl], prefix_cache=shared.cache)
+                    w = out.n_target_tokens / n_tot
+                    (out.loss * w).backward()
+                    shared.accumulate()
+                    loss_local += out.loss.detach().float() * w
+                    del out
+                n_tok = torch.tensor(float(n_tot), device=device)
+            else:
+                out = pc.forward(vmat, targets, prefix_cache=shared.cache)
+                out.loss.backward()
+                shared.accumulate()
+                loss_local = out.loss.detach().float()
+                n_tok = torch.tensor(float(out.n_target_tokens), device=device)
+                del out
             FT.set_persistent_unshard(model, False)
             shared.backward()
             losses = [torch.zeros((), device=device) for _ in range(world)]

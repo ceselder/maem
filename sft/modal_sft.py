@@ -820,6 +820,8 @@ def tp_exactness(data_dir: str = "/data/banks/realact_short_smoke3", n_records: 
     # four world-8 legs over the SAME window: fsdp (reference dump + trace), fsdp again (noise floor: compare vs the dump),
     # tp with the fused norm (production), tp with HF's eager norm (isolates the fused-norm contribution)
     all_legs = {"fsdp": [], "fsdp-rerun": ["--compare-only", "1", "--tag", "fsdp-rerun"],
+                # same objective, different GEMM shapes (each rank's micro-batch as 2 halves): the bf16 re-rounding noise floor
+                "fsdp-split2": ["--compare-only", "1", "--split", "2", "--tag", "fsdp-split2"],
                 "tp": ["--fused-norm", "1"], "tp-nofused": ["--fused-norm", "0", "--tag", "tp-nofused"],
                 "tp-fp32reduce": ["--fused-norm", "1", "--reduce-fp32", "1", "--tag", "tp-fp32reduce"],
                 "tp-nofused-fp32reduce": ["--fused-norm", "0", "--reduce-fp32", "1", "--tag", "tp-nofused-fp32reduce"]}
