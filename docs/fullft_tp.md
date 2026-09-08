@@ -130,6 +130,8 @@ that JIT-compiles / autotunes the fla + Triton kernels in BOTH paths; median of 
 | TP-8 mb 512 x ga 8 | 4,096 | 5.77 (5.0-5.9 once warm) | **696** (711-814 warm) | 281-362 | **166.7** |
 | TP-8 mb 256 x ga 16 | 4,096 | 6.49 | 607 | 251-291 | 112 |
 | TP-8 mb 512 x ga 8, eager HF norm (`--tp-fused-norm 0`) | 4,096 | OOM | -- | -- | > 178 |
+| TP-8 mb 512 x ga 8, fp32 all-reduces (`--tp-reduce-fp32 1`) | 4,096 | OOM at step 3 (6.7-7.3 s before) | -- | -- | > 178 |
+| TP-8 mb 256 x ga 16, fp32 all-reduces | 4,096 | 6.66 | 613 | 254-287 | 112 |
 | TP-8 mb 512 x ga 1 | 512 | 1.33 (0.9-2.3, tokens 7-17k) | 386 | 165-197 | 154 |
 | TP-8 mb 256 x ga 2 | 512 | 2.35 | 223 | ~100 | 112 |
 | TP-8 mb 128 x ga 4 | 512 | 2.49 | 218 | ~90 | 85 |
@@ -155,11 +157,24 @@ GDN gated-norm fp32 upcasts ~10 GB, conv 2.4 GB, l2norm 2.4 GB, head ~3 GB; stat
 grads, Adam 54) ~61 GB. The eager HF norm adds ~50 GB and OOMs. mb 512 has no headroom for the longest length buckets
 (512 x 57 tokens = 29k tokens would need ~230 GB) -> production must use mb 256 (or `--length-bucket`/a token cap).
 
-Exactness on the real 27B (`sft/tp_exactness.py`, `sft/results/tp_exactness_*.json`; same DP-dealt window, mb 32/rank =
-TP mb 256, DP-emulating loss normalisation): see the run report for the FSDP-vs-FSDP noise floor and the two TP variants.
-First run (TP fused norm vs FSDP2): step-0 loss 5.6099 vs 5.6046 (|d| 5.3e-3), grad norm 77.8 vs 76.6, gradient
-global cos 0.9941 (794/851 params below 0.999; worst 0.93 on 5120-element input_layernorm weights whose gradient is a
-cancelling sum), 20-step traces: mean |d loss| 0.18 with one 2.1 spike at step 6 (TP gnorm 224 vs FSDP 5).
+Exactness on the real 27B (`sft/tp_exactness.py`, `sft/results/tp_exactness_v*.json`; the same DP-dealt window, mb 32 per DP
+rank = TP mb 256, DP-emulating loss normalisation; step 0 compared before the optimizer step, then 20 constant-lr AdamW steps):
+
+| leg (vs one FSDP2 reference run) | step-0 loss (ref 5.6048) | grad norm (ref 76.7) | grad cos global / median / worst | params cos < 0.999 | 20-step trace mean / max abs loss diff |
+|---|---|---|---|---|---|
+| FSDP2 **re-run** (noise floor: fla atomics, NCCL order) | 5.6039 (-9e-4) | 76.4 | 0.99972 / 0.99972 / 0.992 | 23 | 0.14 / 1.24 |
+| TP-8, fused norm (production default) | 5.6100 (+5.1e-3; v1 run 5.6099) | 79.9 (v1 77.8) | 0.9926 / 0.9939 / 0.86 | 819 | 0.065 / 0.20 (v1: 0.18 / 2.1) |
+| TP-8, eager HF norm (`--tp-fused-norm 0`) | 5.6052 (+3.5e-4) | 78.7 | 0.9907 / 0.9938 / 0.69 | 816 | 0.05 / 0.29 |
+| TP-8, fused norm, fp32 activation all-reduces (`--tp-reduce-fp32 1`) | see run report (v3) | | | | |
+
+Reading: the bf16 FSDP2 path is itself only reproducible to ~1e-3 in loss and 0.9997 in gradient cosine, and its 20-step
+trace wanders by up to 1.2 in loss on the same data (chaotic after a few steps) -- the TP traces sit inside that band.
+TP's step-0 gradient, however, is ~25x further from the reference than a re-run (median cos 0.994 vs 0.9997) with either
+norm, so the difference is not the fused norm; the fused norm shifts the loss by +5e-3 (its bf16 output rounding differs
+from HF's eager norm), the eager norm is within 4e-4. The remaining candidate is the bf16 accumulation of the tp partial
+GEMM sums inside NCCL (up to 7 extra bf16 roundings per row-parallel output, 128 times per forward) -- tested by the
+`--tp-reduce-fp32` leg. The CPU/gloo unit test (deterministic fp32 kernels) matches the single-process reference to
+1e-6, so the sharding arithmetic itself is exact.
 
 ## 10. Risks / not done
 

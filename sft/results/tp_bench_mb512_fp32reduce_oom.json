@@ -1,0 +1,111 @@
+{
+ "data_dir": "/data/banks/realact_short_smoke3",
+ "n_records": 132000,
+ "common": "--full-ft --tp 8 --prefix-cache --grad-ckpt 0 --pad-multiple 1 --prefix-share-step --log-steps 1",
+ "max_seq": 160,
+ "lr": 1e-05,
+ "stop_after_step": 8,
+ "gpu": "NVIDIA B200",
+ "runs": [
+  {
+   "tag": "mb512_ga8",
+   "batch_size": 512,
+   "grad_accum": 8,
+   "eff_batch": 4096,
+   "tp": 8,
+   "extra": "--tp-reduce-fp32 1",
+   "cmd": "torchrun --standalone --nproc_per_node=8 SL/pretrain.py --data-dir /root/bank_bench_132000 --save-dir /tmp/bench_mb512_ga8 --run-name _bench_mb512_ga8 --n-ckpts 1 --epochs 1 --batch-size 512 --grad-accum 8 --lr 1e-05 --max-seq 160 --no-wandb --full-ft --tp 8 --prefix-cache --grad-ckpt 0 --pad-multiple 1 --prefix-share-step --log-steps 1 --tp-reduce-fp32 1",
+   "rc": 1,
+   "stopped_by_bench": false,
+   "oom": true,
+   "wall_s": 202.28955936431885,
+   "gpu_mem_used_after_mib": [
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4
+   ],
+   "steps": [
+    {
+     "step": 0,
+     "steps_total": 33,
+     "loss": 4.8945,
+     "tflops": 14.0,
+     "mfu": 1,
+     "ex_s": 31.54,
+     "tok_s": 673.0,
+     "pad_frac": 0.003,
+     "dt": 129.886,
+     "micro": 8,
+     "peak_gb": 141.5,
+     "profiled": false
+    },
+    {
+     "step": 1,
+     "steps_total": 33,
+     "loss": 5.0767,
+     "tflops": 197.0,
+     "mfu": 13,
+     "ex_s": 560.2,
+     "tok_s": 9747.0,
+     "pad_frac": 0.0,
+     "dt": 7.312,
+     "micro": 8,
+     "peak_gb": 150.8,
+     "profiled": false
+    },
+    {
+     "step": 2,
+     "steps_total": 33,
+     "loss": 4.7716,
+     "tflops": 257.0,
+     "mfu": 17,
+     "ex_s": 608.76,
+     "tok_s": 12764.0,
+     "pad_frac": 0.003,
+     "dt": 6.728,
+     "micro": 8,
+     "peak_gb": 161.4,
+     "profiled": false
+    }
+   ],
+   "notes": [
+    "132000 records, 3000 vectors (vecs.f16), world=8 (tensor-parallel: every rank holds all 132000 records)",
+    "[pretrain] loaded + tokenized 132000 local records in 5.5s (12 MB of tokenized rows on this rank)",
+    "[fullft] kernel backends: {'torch_chunk_gated_delta_rule': 'fla.ops.gated_delta_rule.chunk.chunk_gated_delta_rule', 'causal_conv1d_fn': 'torch fallback', 'fla': 'v0.5.2', 'attn_implementation': 'sdpa'} | optim adamw | suffix_ckpt False | prefix_head_on_labels False ce_chunk 0 | prefix_share_step True | tp 8",
+    "[fullft] non-text base tensors (348, 1.65 GB) staged at /tmp/base_nontext.safetensors in 0s",
+    "[pretrain] grad_ckpt=0 autocast_bf16=False compile=False compile_mode=default head_on_labels=False grad_accum=8 fla=v0.5.2 gpu=NVIDIA B200",
+    "[pretrain] prefix-cache ON: shared prefix 102 tokens, suffix = 1 prompt token(s) + target, prefix shared by 1 micro-batch(es) of 512, suffix padded to a multiple of 1",
+    "[pretrain] prefix-share-step ON: one prefix fwd/bwd per optimizer step; fp32 cache-gradient accumulation, one parameter-gradient reduction",
+    "[pretrain] micro-batch composition: legacy (length-sorted micro-batches, shuffled whole)",
+    "steps_total 33 (258 micro-batches/epoch, grad_accum 8), checkpoint every 33 steps",
+    "[fullft] injection check @layer 1 [prefix forward, no injection expected; B=1 L=102]: marker-row norm ratio post/pre = 1.000 (min 1.000 max 1.000; ~1.41 expected on the suffix, 1.00 = no injection) -> OK",
+    "[fullft] injection check @layer 1 [suffix forward, marker = index 0; B=512 L=17]: marker-row norm ratio post/pre = 1.396 (min 1.042 max 1.628; ~1.41 expected on the suffix, 1.00 = no injection) -> OK",
+    "[fullft] injection check @layer 1 [suffix forward, marker = index 0; B=512 L=20]: marker-row norm ratio post/pre = 1.383 (min 0.980 max 1.656; ~1.41 expected on the suffix, 1.00 = no injection) -> OK",
+    "[fullft] injection check @layer 1 [suffix forward, marker = index 0; B=512 L=17]: marker-row norm ratio post/pre = 1.394 (min 1.042 max 1.628; ~1.41 expected on the suffix, 1.00 = no injection) -> OK",
+    "[fullft] injection check @layer 1 [suffix forward, marker = index 0; B=512 L=14]: marker-row norm ratio post/pre = 1.387 (min 1.034 max 1.582; ~1.41 expected on the suffix, 1.00 = no injection) -> OK",
+    "[fullft] injection check @layer 1 [suffix forward, marker = index 0; B=512 L=31]: marker-row norm ratio post/pre = 1.406 (min 1.045 max 1.643; ~1.41 expected on the suffix, 1.00 = no injection) -> OK",
+    "[fullft] injection check @layer 1 [suffix forward, marker = index 0; B=512 L=23]: marker-row norm ratio post/pre = 1.414 (min 1.084 max 1.698; ~1.41 expected on the suffix, 1.00 = no injection) -> OK",
+    "[fullft] injection check @layer 1 [suffix forward, marker = index 0; B=512 L=34]: marker-row norm ratio post/pre = 1.407 (min 1.049 max 1.581; ~1.41 expected on the suffix, 1.00 = no injection) -> OK",
+    "[fullft] injection check @layer 1 [suffix forward, marker = index 0; B=512 L=15]: marker-row norm ratio post/pre = 1.398 (min 1.099 max 1.624; ~1.41 expected on the suffix, 1.00 = no injection) -> OK",
+    "[optim] adamw: state 25.2 GB on rank 0 after the first step | peak 141.5 GB"
+   ],
+   "summary": {
+    "n_measured": 1,
+    "mean_dt": 6.728,
+    "median_dt": 6.728,
+    "ex_s": 608.7990487514863,
+    "mean_ex_s_printed": 608.76,
+    "mean_tok_s": 12764.0,
+    "mean_mfu": 17.0,
+    "mean_pad": 0.003,
+    "peak_gb": 161.4
+   }
+  }
+ ],
+ "wall_min": 3.4365407745043437
+}
