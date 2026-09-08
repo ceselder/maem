@@ -810,20 +810,35 @@ def tp_exactness(data_dir: str = "/data/banks/realact_short_smoke3", n_records: 
     out = "/tmp/tp_exact"
     results = {"data_dir": data_dir, "n_records": n_records, "batch_size": batch_size, "steps": steps, "lr": lr, "rc": {}}
     if unit_test:
-        for kv in ("2", "1"):
-            rc = _stream(["torchrun", "--standalone", "--nproc_per_node=2", "SL/test_tp.py", "--kv-heads", kv], env, f"tp-unit-kv{kv}")
-            results["rc"][f"unit_kv{kv}"] = rc
-    for mode in ("fsdp", "tp"):
+        # GPU unit tests: fp32 tiny model; on GPU fla's chunk backward accumulates dg with atomics, so the g-path params
+        # (A_log, dt_bias, in_proj_a) land at rel ~3e-3 rather than the CPU/gloo 1e-4 -- read the cos / loss lines
+        for tag_, args_ in (("kv2", ["--kv-heads", "2"]), ("kv1", ["--kv-heads", "1"]),
+                            ("kv2-fused-d1024", ["--kv-heads", "2", "--fused-norm", "1", "--d", "1024"])):
+            rc = _stream(["torchrun", "--standalone", "--nproc_per_node=2", "SL/test_tp.py"] + args_, env, f"tp-unit-{tag_}")
+            results["rc"][f"unit_{tag_}"] = rc
+    # four world-8 legs over the SAME window: fsdp (reference dump + trace), fsdp again (noise floor: compare vs the dump),
+    # tp with the fused norm (production), tp with HF's eager norm (isolates the fused-norm contribution)
+    legs = [("fsdp", []), ("fsdp-rerun", ["--compare-only", "1", "--tag", "fsdp-rerun"]),
+            ("tp", ["--fused-norm", "1"]), ("tp-nofused", ["--fused-norm", "0", "--tag", "tp-nofused"])]
+    for tag_, extra_ in legs:
+        mode = "fsdp" if tag_.startswith("fsdp") else "tp"
         cmd = ["torchrun", "--standalone", "--nproc_per_node=8", "SL/tp_exactness.py", "--mode", mode, "--data-dir", bank,
-               "--out", out, "--batch-size", str(batch_size), "--steps", str(steps), "--lr", str(lr), "--max-seq", str(max_seq)]
-        rc = _stream(cmd, env, f"tpx-{mode}")
-        results["rc"][mode] = rc
+               "--out", out, "--batch-size", str(batch_size), "--steps", str(steps), "--lr", str(lr), "--max-seq", str(max_seq)] + extra_
+        rc = _stream(cmd, env, f"tpx-{tag_}")
+        results["rc"][tag_] = rc
         if rc != 0:
-            print(f"[tpx] {mode} exited rc={rc}; aborting", flush=True)
+            print(f"[tpx] {tag_} exited rc={rc}; aborting", flush=True)
             break
-    if os.path.exists(f"{out}/tp_exactness.json"):
-        results["result"] = json.load(open(f"{out}/tp_exactness.json"))
-        results["summary"] = results["result"]["summary"]
+        if (time.time() - t_start) / 60 > 60:
+            print("[tpx] over 60 min; stopping after this leg", flush=True)
+            break
+    results["summaries"] = {}
+    for tag_ in ("fsdp-rerun", "tp", "tp-nofused"):
+        fn = f"{out}/{tag_}_exactness.json"
+        if os.path.exists(fn):
+            r = json.load(open(fn))
+            results["summaries"][tag_] = r["summary"]
+            results.setdefault("result", {})[tag_] = r
     results["wall_min"] = (time.time() - t_start) / 60
     print("TP_EXACTNESS_JSON_BEGIN"); print(json.dumps({k: v for k, v in results.items() if k != "result"})); print("TP_EXACTNESS_JSON_END", flush=True)
     return {k: v for k, v in results.items() if k != "result"}

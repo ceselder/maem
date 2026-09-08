@@ -43,6 +43,42 @@ def log(*a, **k):
         print(*a, **k, flush=True)
 
 
+def compare_with_dump(gdir, named_grads, device, is_main, log, label):
+    """Compare (name, full fp32 grad) pairs -- produced COLLECTIVELY by every rank -- with the fsdp dump in gdir (rank 0 reads).
+    Returns the summary dict on rank 0 (None elsewhere)."""
+    names = json.load(open(f"{gdir}/names.json"))
+    name_to_idx = {n: i for i, n in enumerate(names)}
+    rows, num, den_a, den_b, max_abs = {}, 0.0, 0.0, 0.0, 0.0
+    t_c = time.time()
+    for name, g in named_grads:
+        if is_main:
+            ref = torch.load(f"{gdir}/{name_to_idx[name]:04d}.pt").to(device)
+            x, y = g.double().flatten(), ref.double().flatten()
+            dot, nx, ny = float((x * y).sum()), float(x.norm()), float(y.norm())
+            d = float((x - y).abs().max()); rel = float((x - y).norm()) / max(ny, 1e-30)
+            rows[name] = dict(cos=dot / max(nx * ny, 1e-30), max_abs=d, rel=rel, norm_ref=ny, norm_tp=nx)
+            num += dot; den_a += nx * nx; den_b += ny * ny; max_abs = max(max_abs, d)
+            del ref
+        del g
+    if not is_main:
+        return None
+    worst = min(rows, key=lambda n: rows[n]["cos"])
+    big = {n: r for n, r in rows.items() if r["norm_ref"] > 0 and n.endswith("proj.weight")}
+    compare = dict(label=label, global_cos=num / max(math.sqrt(den_a * den_b), 1e-30), worst_cos=rows[worst]["cos"], worst_name=worst,
+                   max_abs=max_abs, n_params=len(rows),
+                   n_cos_below_0999=sum(1 for r in rows.values() if r["cos"] < 0.999),
+                   n_cos_below_099=sum(1 for r in rows.values() if r["cos"] < 0.99),
+                   median_cos=float(np.median([r["cos"] for r in rows.values()])),
+                   median_cos_proj=float(np.median([r["cos"] for r in big.values()])) if big else None,
+                   worst20=sorted(rows.items(), key=lambda kv: kv[1]["cos"])[:20], per_param=rows)
+    log(f"[exact:{label}] GRAD COMPARE vs FSDP2 reference: {len(rows)} params, global cos {compare['global_cos']:.6f}, "
+        f"median cos {compare['median_cos']:.6f} (proj weights {compare['median_cos_proj']:.6f}), worst cos {compare['worst_cos']:.6f} ({worst}), "
+        f"max|d| {max_abs:.3e}, {compare['n_cos_below_0999']} params with cos < 0.999, {compare['n_cos_below_099']} < 0.99 ({time.time() - t_c:.0f}s)")
+    for n, r in compare["worst20"][:10]:
+        log(f"[exact:{label}]   cos {r['cos']:.6f} rel {r['rel']:.3e} max|d| {r['max_abs']:.3e} |ref| {r['norm_ref']:.3e} {n}")
+    return compare
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True, choices=["fsdp", "tp"])
@@ -54,7 +90,12 @@ def main():
     ap.add_argument("--max-seq", type=int, default=160)
     ap.add_argument("--dump-grads", type=int, default=1)
     ap.add_argument("--fused-norm", type=int, default=1)
+    ap.add_argument("--compare-only", type=int, default=0,
+                    help="fsdp mode: compare this run's step-0 grads with the existing dump instead of writing one (FSDP-vs-FSDP "
+                         "noise floor: fla atomics / nondeterministic reductions)")
+    ap.add_argument("--tag", default="", help="suffix for the trace / result file names (default: the mode)")
     a = ap.parse_args()
+    tag = a.tag or a.mode
 
     world = int(os.environ["WORLD_SIZE"]); rank = int(os.environ["RANK"]); local = int(os.environ["LOCAL_RANK"])
     dist.init_process_group("nccl"); torch.cuda.set_device(local)
@@ -124,7 +165,11 @@ def main():
             group_losses = [float(x) for x in losses]
             group_ntok = [int(x) for x in ntoks]
             loss_step = float(sum(group_losses) / world)
-            if k == 0 and a.dump_grads:
+            if k == 0 and a.dump_grads and a.compare_only:
+                gdir = f"{a.out}/ref_grads"
+                compare = compare_with_dump(gdir, ((n, p.grad.full_tensor() if hasattr(p.grad, "full_tensor") else p.grad.detach())
+                                                   for n, p in model.named_parameters()), device, is_main, log, "fsdp-rerun")
+            elif k == 0 and a.dump_grads:
                 # every rank all-gathers each full grad (collective); rank 0 writes fp32 .pt files
                 gdir = f"{a.out}/ref_grads"
                 if is_main:
@@ -163,33 +208,8 @@ def main():
             tpm.reduce_grads()
             if k == 0 and a.dump_grads:
                 gdir = f"{a.out}/ref_grads"
-                names = json.load(open(f"{gdir}/names.json"))
-                name_to_idx = {n: i for i, n in enumerate(names)}
-                rows, num, den_a, den_b, max_abs = {}, 0.0, 0.0, 0.0, 0.0
-                t_c = time.time()
-                for name, p, m, spec in tpm.masters:
-                    g_tp = TP.gathered_grads_one(tpm, name, m, spec)
-                    if is_main:
-                        ref = torch.load(f"{gdir}/{name_to_idx[name]:04d}.pt").to(device)
-                        x, y = g_tp.double().flatten(), ref.double().flatten()
-                        dot, nx, ny = float((x * y).sum()), float(x.norm()), float(y.norm())
-                        d = float((x - y).abs().max()); rel = float((x - y).norm()) / max(ny, 1e-30)
-                        rows[name] = dict(cos=dot / max(nx * ny, 1e-30), max_abs=d, rel=rel, norm_ref=ny, norm_tp=nx)
-                        num += dot; den_a += nx * nx; den_b += ny * ny; max_abs = max(max_abs, d)
-                        del ref
-                    del g_tp
-                if is_main:
-                    worst = min(rows, key=lambda n: rows[n]["cos"])
-                    compare = dict(global_cos=num / max(math.sqrt(den_a * den_b), 1e-30), worst_cos=rows[worst]["cos"], worst_name=worst,
-                                   max_abs=max_abs, n_params=len(rows),
-                                   n_cos_below_0999=sum(1 for r in rows.values() if r["cos"] < 0.999),
-                                   n_cos_below_099=sum(1 for r in rows.values() if r["cos"] < 0.99),
-                                   worst20=sorted(rows.items(), key=lambda kv: kv[1]["cos"])[:20], per_param=rows)
-                    log(f"[exact:tp] GRAD COMPARE vs FSDP2 reference: {len(rows)} params, global cos {compare['global_cos']:.6f}, "
-                        f"worst cos {compare['worst_cos']:.6f} ({worst}), max|d| {max_abs:.3e}, "
-                        f"{compare['n_cos_below_0999']} params with cos < 0.999 ({time.time() - t_c:.0f}s)")
-                    for n, r in compare["worst20"][:10]:
-                        log(f"[exact:tp]   cos {r['cos']:.6f} rel {r['rel']:.3e} max|d| {r['max_abs']:.3e} |ref| {r['norm_ref']:.3e} {n}")
+                compare = compare_with_dump(gdir, ((name, TP.gathered_grads_one(tpm, name, m, spec)) for name, p, m, spec in tpm.masters),
+                                            device, is_main, log, "tp" + ("" if a.fused_norm else "-nofused"))
             gn = tpm.clip_grad_norm(1.0)
         opt.step(); opt.zero_grad()
         if tpm is not None:
@@ -203,14 +223,14 @@ def main():
             + (f" | per-rank losses {[round(x, 4) for x in group_losses]}" if group_losses else ""))
 
     if is_main:
-        json.dump(dict(mode=a.mode, batch_size=a.batch_size, steps=n_steps, lr=a.lr, trace=trace),
-                  open(f"{a.out}/{a.mode}_trace.json", "w"), indent=1)
-        if a.mode == "tp":
+        json.dump(dict(mode=a.mode, tag=tag, fused_norm=a.fused_norm, batch_size=a.batch_size, steps=n_steps, lr=a.lr, trace=trace),
+                  open(f"{a.out}/{tag}_trace.json", "w"), indent=1)
+        if a.mode == "tp" or a.compare_only:
             ref = json.load(open(f"{a.out}/fsdp_trace.json"))
             pairs = [(r["step"], r["loss"], t["loss"]) for r, t in zip(ref["trace"], trace)]
-            log("[exact] step | fsdp loss | tp loss | diff")
-            for s, lf, lt in pairs:
-                log(f"[exact] {s:4d} | {lf:.5f} | {lt:.5f} | {lt - lf:+.5f}")
+            log(f"[exact] step | fsdp loss | {tag} loss | diff")
+            for s_, lf, lt in pairs:
+                log(f"[exact] {s_:4d} | {lf:.5f} | {lt:.5f} | {lt - lf:+.5f}")
             diffs = [abs(lt - lf) for _, lf, lt in pairs]
             summary = dict(step0_loss_fsdp=pairs[0][1], step0_loss_tp=pairs[0][2], step0_abs_diff=diffs[0],
                            max_abs_diff=max(diffs), mean_abs_diff=sum(diffs) / len(diffs),
@@ -219,8 +239,9 @@ def main():
                            fsdp_mean_dt=float(np.mean([r["dt"] for r in ref["trace"][1:]])) if len(ref["trace"]) > 1 else None,
                            tp_mean_dt=float(np.mean([r["dt"] for r in trace[1:]])) if len(trace) > 1 else None,
                            grad_compare={k: v for k, v in (compare or {}).items() if k != "per_param"})
+            summary["tag"] = tag
             json.dump(dict(summary=summary, pairs=pairs, fsdp=ref, tp=dict(trace=trace), grad_compare=compare),
-                      open(f"{a.out}/tp_exactness.json", "w"), indent=1)
+                      open(f"{a.out}/{tag}_exactness.json", "w"), indent=1)
             print("TP_EXACTNESS_JSON_BEGIN"); print(json.dumps(summary)); print("TP_EXACTNESS_JSON_END", flush=True)
     dist.barrier()
     dist.destroy_process_group()

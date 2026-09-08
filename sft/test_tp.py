@@ -43,8 +43,8 @@ def tiny_model(seed, kv_heads, dtype):
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
     torch.manual_seed(seed)
-    cfg = Qwen3_5TextConfig(vocab_size=VOCAB, hidden_size=D, intermediate_size=512, num_hidden_layers=3,
-                            num_attention_heads=4, num_key_value_heads=kv_heads, head_dim=64,
+    cfg = Qwen3_5TextConfig(vocab_size=VOCAB, hidden_size=D, intermediate_size=2 * D, num_hidden_layers=3,
+                            num_attention_heads=4, num_key_value_heads=kv_heads, head_dim=D // 4,
                             linear_key_head_dim=32, linear_value_head_dim=32, linear_num_key_heads=2, linear_num_value_heads=4,
                             layer_types=["linear_attention", "full_attention", "linear_attention"],
                             max_position_embeddings=256, pad_token_id=0, eos_token_id=1, tie_word_embeddings=False)
@@ -87,7 +87,11 @@ def main():
     ap.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tol", type=float, default=1e-4)
+    ap.add_argument("--fused-norm", type=int, default=0, help="1 = fla fused RMSNorm on the TP model (GPU only); d must be > 512 for the 27B's kernel path")
+    ap.add_argument("--d", type=int, default=256, help="hidden size of the tiny model (256; 1024 exercises fla's D > 512 norm kernel)")
     a = ap.parse_args()
+    global D
+    D = a.d
     dtype = torch.float32 if a.dtype == "fp32" else torch.bfloat16
     tol = a.tol if dtype == torch.float32 else 3e-2
 
@@ -96,13 +100,13 @@ def main():
     device = "cpu"
     if torch.cuda.is_available() and os.environ.get("DDP_BACKEND") == "nccl":
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"])); device = f"cuda:{rank}"
-    log(f"[test_tp] torch {torch.__version__} | world {world} | kv_heads {a.kv_heads} | dtype {a.dtype} | tol {tol:g} | device {device}")
+    log(f"[test_tp] torch {torch.__version__} | world {world} | kv_heads {a.kv_heads} | dtype {a.dtype} | tol {tol:g} | device {device} | d {D} | fused_norm {a.fused_norm}")
     failures = []
 
     ref = tiny_model(a.seed, a.kv_heads, dtype).to(device)
     full_params = {n: p.detach().clone() for n, p in ref.named_parameters()}
     tpmodel = copy.deepcopy(ref)
-    tpm = TP.shard_model_tp(tpmodel, world, device, log=log, fused_norm=False)
+    tpm = TP.shard_model_tp(tpmodel, world, device, log=log, fused_norm=bool(a.fused_norm))
     tpm.build_masters()
     n_local = tpm.local_param_count(); n_full = sum(p.numel() for p in ref.parameters())
     log(f"[test_tp] params: full {n_full}, local {n_local} ({n_local / n_full:.3f} of full; 1/tp = {1 / world:.3f} + replicated norms)")
