@@ -88,10 +88,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tol", type=float, default=1e-4)
     ap.add_argument("--fused-norm", type=int, default=0, help="1 = fla fused RMSNorm on the TP model (GPU only); d must be > 512 for the 27B's kernel path")
-    ap.add_argument("--d", type=int, default=256, help="hidden size of the tiny model (256; 1024 exercises fla's D > 512 norm kernel)")
+    ap.add_argument("--hidden", type=int, default=256, help="hidden size of the tiny model (256; 1024 exercises fla's D > 512 norm kernel). Not --d: torchrun swallows it")
     a = ap.parse_args()
     global D
-    D = a.d
+    D = a.hidden
     dtype = torch.float32 if a.dtype == "fp32" else torch.bfloat16
     tol = a.tol if dtype == torch.float32 else 3e-2
 

@@ -814,7 +814,7 @@ def tp_exactness(data_dir: str = "/data/banks/realact_short_smoke3", n_records: 
         # GPU unit tests: fp32 tiny model; on GPU fla's chunk backward accumulates dg with atomics, so the g-path params
         # (A_log, dt_bias, in_proj_a) land at rel ~3e-3 rather than the CPU/gloo 1e-4 -- read the cos / loss lines
         for tag_, args_ in (("kv2", ["--kv-heads", "2"]), ("kv1", ["--kv-heads", "1"]),
-                            ("kv2-fused-d1024", ["--kv-heads", "2", "--fused-norm", "1", "--d", "1024"])):
+                            ("kv2-fused-d1024", ["--kv-heads", "2", "--fused-norm", "1", "--hidden", "1024"])):
             rc = _stream(["torchrun", "--standalone", "--nproc_per_node=2", "SL/test_tp.py"] + args_, env, f"tp-unit-{tag_}")
             results["rc"][f"unit_{tag_}"] = rc
     # four world-8 legs over the SAME window: fsdp (reference dump + trace), fsdp again (noise floor: compare vs the dump),
