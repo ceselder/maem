@@ -472,10 +472,12 @@ class PrefixCache:
         self._prefix_logits = out.logits if self.keep_prefix_grad_path else None   # [1, 1, V] (logits_to_keep=1)
         return cache
 
-    def forward(self, vecs, targets, autocast=contextlib.nullcontext, max_len=None, prefix_cache=None, timings=None):
+    def forward(self, vecs, targets, autocast=contextlib.nullcontext, max_len=None, prefix_cache=None, timings=None,
+                model_kwargs=None):
         """Full prefix-cached step. ``autocast``: zero-arg callable returning a context manager (e.g.
         ``lambda: autocast_region(model, True)``), applied to BOTH forwards. ``timings``: optional dict that receives
         CUDA-synchronized phase durations (prefix_fwd_s, expand_s, suffix_fwd_s) -- profiling only, it syncs.
+        ``model_kwargs``: extra kwargs for the suffix model call (sft/tp.py: ``loss_group_ids`` for the DP-emulating loss).
         Returns SimpleNamespace(loss, logits, labels, suffix_mask, n_target_tokens, suffix_len, prefix_len)."""
         import time
 
@@ -517,7 +519,7 @@ class PrefixCache:
         try:
             with hook_cm, autocast():
                 out = self.model(input_ids=ids.to(self.device), attention_mask=full_mask, position_ids=position_ids,
-                                 past_key_values=cache, use_cache=True, labels=labels.to(self.device))
+                                 past_key_values=cache, use_cache=True, labels=labels.to(self.device), **(model_kwargs or {}))
         finally:
             if self.suffix_ckpt is not None:
                 self.suffix_ckpt.enabled = False

@@ -84,6 +84,9 @@ image = (
     .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/SL/prefix_cache.py")   # --prefix-cache sibling import
     .add_local_file(REPO / "sft" / "fullft.py", "/pmx/SL/fullft.py")               # --full-ft (FSDP2) sibling import
     .add_local_file(REPO / "sft" / "fullft_smoke.py", "/pmx/SL/fullft_smoke.py")   # 2-rank exactness smoke of the full-ft knobs
+    .add_local_file(REPO / "sft" / "tp.py", "/pmx/SL/tp.py")                       # --tp (tensor parallel) sibling import
+    .add_local_file(REPO / "sft" / "test_tp.py", "/pmx/SL/test_tp.py")             # TP unit test (tiny model, TP-2)
+    .add_local_file(REPO / "sft" / "tp_exactness.py", "/pmx/SL/tp_exactness.py")   # TP-8 vs FSDP2 on the real 27B
     .add_local_file(REPO / "sft" / "fp8.py", "/pmx/SL/fp8.py")            # --fp8-base (imported by pretrain.py)
     .add_local_file(REPO / "sft" / "fp8_eval.py", "/pmx/SL/fp8_eval.py")  # fp8 speed/fidelity harness (fp8_eval fn)
     .add_local_file(REPO / "sft" / "fp8_microbench.py", "/pmx/SL/fp8_microbench.py")  # fp8 GEMM/layer/profile bench
@@ -702,14 +705,19 @@ def fullft_bench(data_dir: str, configs: str = "32x64;64x32;128x16", n_records: 
         meas = [s for s in steps if s["step"] >= 2 and not s.get("profiled")] or steps[1:] or steps
         summ = {}
         if meas:
-            ex_per_step = 8 * B * GA
+            # --tp N: every rank runs the same examples (no data parallelism) -> examples/step = B * GA, not 8 * B * GA
+            tp_m = re.search(r"--tp\s+(\d+)", common + " " + extra)
+            dp = 1 if (tp_m and int(tp_m[1]) > 0) else 8
+            ex_per_step = dp * B * GA
             mean_dt = sum(s["dt"] for s in meas) / len(meas)
             summ = dict(n_measured=len(meas), mean_dt=mean_dt, median_dt=sorted(s["dt"] for s in meas)[len(meas) // 2],
                         ex_s=ex_per_step / mean_dt, mean_ex_s_printed=sum(s["ex_s"] for s in meas) / len(meas),
                         mean_tok_s=sum(s["tok_s"] for s in meas) / len(meas),
                         mean_mfu=sum(s["mfu"] for s in meas) / len(meas), mean_pad=sum(s["pad_frac"] for s in meas) / len(meas),
                         peak_gb=max(s["peak_gb"] for s in steps))
-        res = dict(tag=tag, batch_size=B, grad_accum=GA, eff_batch=8 * B * GA, extra=extra, cmd=" ".join(cmd),
+        tp_m = re.search(r"--tp\s+(\d+)", common + " " + extra)
+        res = dict(tag=tag, batch_size=B, grad_accum=GA, eff_batch=(1 if (tp_m and int(tp_m[1]) > 0) else 8) * B * GA,
+                   tp=int(tp_m[1]) if tp_m else 0, extra=extra, cmd=" ".join(cmd),
                    rc=p.returncode, stopped_by_bench=stopped, oom=oom, wall_s=time.time() - t0,
                    gpu_mem_used_after_mib=used, steps=steps, notes=notes, summary=summ)
         print(f"[bench {tag}] done: rc={p.returncode} stopped={stopped} oom={oom} wall={res['wall_s']:.0f}s "
@@ -760,6 +768,72 @@ def fullft_smoke(args: str = "") -> int:
 @app.local_entrypoint()
 def run_fullft_smoke(args: str = ""):
     print(fullft_smoke.remote(args))
+
+
+@app.function(
+    image=image,
+    gpu=os.environ.get("SFT_GPU", "B200:8"),
+    volumes={"/data": vol},
+    secrets=[modal.Secret.from_name("maemm-hf"), modal.Secret.from_name("maemm-wandb")],
+    timeout=int(os.environ.get("SFT_TPX_TIMEOUT_S", str(75 * 60))),   # hard cap: the container MUST exit
+    memory=256 * 1024,
+)
+def tp_exactness(data_dir: str = "/data/banks/realact_short_smoke3", n_records: int = 8192, batch_size: int = 32,
+                 steps: int = 20, lr: float = 1e-5, max_seq: int = 160, unit_test: bool = True) -> dict:
+    """TP-8 vs FSDP2 exactness on the real 27B (sft/tp_exactness.py): two world-8 torchruns in ONE container over the same
+    DP-dealt micro-batch window of the (tiny) bank -- FSDP2 first (dumps fp32 reference grads + a `steps`-step loss
+    trace), then TP-8 (gathers its grads, compares, runs the same trace). Optionally runs the TP-2 unit test first
+    (tiny random model, nccl). Nothing is written under /data. Prints the summary JSON between TP_EXACTNESS_JSON_BEGIN/END."""
+    import json
+    import os
+    import shutil
+    import subprocess
+    import time
+
+    t_start = time.time()
+    if not data_dir.startswith("/"):
+        data_dir = f"/data/{data_dir}"
+    _, local_bank, _ = _preflight("_bench_tp_exactness", data_dir, n_ckpts=1, resume_from="")   # stages only
+    local_bank = local_bank.split(",")[0]
+    vec_file, _ = _vec_bank_file(local_bank)
+    bank = f"/root/bank_tpx_{n_records}"
+    if not os.path.exists(bank):
+        os.makedirs(bank)
+        lines = open(f"{local_bank}/records.jsonl").read().splitlines()
+        with open(f"{bank}/records.jsonl", "w") as f:
+            for i in range(n_records):
+                f.write(lines[i % len(lines)] + "\n")
+        shutil.copy(f"{local_bank}/{vec_file}", f"{bank}/{vec_file}")
+    env = _train_env("nccl")
+    out = "/tmp/tp_exact"
+    results = {"data_dir": data_dir, "n_records": n_records, "batch_size": batch_size, "steps": steps, "lr": lr, "rc": {}}
+    if unit_test:
+        for kv in ("2", "1"):
+            rc = _stream(["torchrun", "--standalone", "--nproc_per_node=2", "SL/test_tp.py", "--kv-heads", kv], env, f"tp-unit-kv{kv}")
+            results["rc"][f"unit_kv{kv}"] = rc
+    for mode in ("fsdp", "tp"):
+        cmd = ["torchrun", "--standalone", "--nproc_per_node=8", "SL/tp_exactness.py", "--mode", mode, "--data-dir", bank,
+               "--out", out, "--batch-size", str(batch_size), "--steps", str(steps), "--lr", str(lr), "--max-seq", str(max_seq)]
+        rc = _stream(cmd, env, f"tpx-{mode}")
+        results["rc"][mode] = rc
+        if rc != 0:
+            print(f"[tpx] {mode} exited rc={rc}; aborting", flush=True)
+            break
+    if os.path.exists(f"{out}/tp_exactness.json"):
+        results["result"] = json.load(open(f"{out}/tp_exactness.json"))
+        results["summary"] = results["result"]["summary"]
+    results["wall_min"] = (time.time() - t_start) / 60
+    print("TP_EXACTNESS_JSON_BEGIN"); print(json.dumps({k: v for k, v in results.items() if k != "result"})); print("TP_EXACTNESS_JSON_END", flush=True)
+    return {k: v for k, v in results.items() if k != "result"}
+
+
+@app.local_entrypoint()
+def run_tp_exactness(data_dir: str = "/data/banks/realact_short_smoke3", n_records: int = 8192, batch_size: int = 32,
+                     steps: int = 20, lr: float = 1e-5, max_seq: int = 160, unit_test: bool = True):
+    """Spawn tp_exactness on the DEPLOYED app (detached; prints the call id)."""
+    call = modal.Function.from_name(APP_NAME, "tp_exactness").spawn(
+        data_dir=data_dir, n_records=n_records, batch_size=batch_size, steps=steps, lr=lr, max_seq=max_seq, unit_test=unit_test)
+    print(f"spawned tp_exactness on {APP_NAME}: {call.object_id}")
 
 
 @app.function(image=image, timeout=600, cpu=2)

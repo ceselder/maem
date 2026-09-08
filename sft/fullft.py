@@ -488,10 +488,12 @@ def map_name(name):
     return name   # lm_head.weight
 
 
-def save_full_ckpt(model, path, tok, model_id, is_main, world, nontext_shard=None, shard_bytes=4 * 2**30, log=print, extra_meta=None):
+def save_full_ckpt(model, path, tok, model_id, is_main, world, nontext_shard=None, shard_bytes=4 * 2**30, log=print, extra_meta=None,
+                   gather=None):
     """COLLECTIVE (every rank must call it): all-gather each FSDP2-sharded param (one at a time), rank 0 writes bf16
     safetensors shards in the base layout + config/tokenizer files + the non-text shard + SAVE_DONE. Atomic via
-    <path>.tmp -> rename."""
+    <path>.tmp -> rename. `gather(name, param) -> full tensor` overrides the per-param gathering (sft/tp.py's
+    TPModel.gather_full for tensor-parallel shards); default = DTensor.full_tensor() / the param itself."""
     from safetensors.torch import save_file
     try:
         from torch.distributed.tensor import DTensor
@@ -521,7 +523,10 @@ def save_full_ckpt(model, path, tok, model_id, is_main, world, nontext_shard=Non
 
     for name, p in model.named_parameters():   # identical order on every rank -> the all-gathers line up
         with torch.no_grad():
-            full = p.full_tensor() if isinstance(p, DTensor) else p.detach()
+            if gather is not None:
+                full = gather(name, p)
+            else:
+                full = p.full_tensor() if isinstance(p, DTensor) else p.detach()
         if is_main:
             t = full.detach().to(torch.bfloat16).cpu().contiguous()
             k = map_name(name)

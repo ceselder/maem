@@ -567,6 +567,15 @@ def main():
                          "backward); -1 = all 64 layers (+54 GB/rank), N = +0.84 GB/rank per layer. Exact (comm only).")
     ap.add_argument("--fsdp-prefetch", type=int, default=0,
                     help="--full-ft: explicit FSDP2 all-gather prefetch depth (0 = implicit one-ahead)")
+    ap.add_argument("--tp", type=int, default=0,
+                    help="--full-ft: TENSOR-PARALLEL degree instead of FSDP2 (sft/tp.py). Must equal the world size (one node: "
+                         "--tp 8 on 8 GPUs; no data parallelism). Every rank runs ALL examples of the micro-batch through its 1/tp "
+                         "slice of every matmul, so --batch-size is the NODE micro-batch (effective batch = batch-size x grad-accum) "
+                         "and every rank loads the whole bank. fp32 masters + AdamW for the local shard, bf16 compute, full HF "
+                         "checkpoints exactly as the FSDP2 path. Works with --prefix-cache --prefix-share-step --pad-multiple 1.")
+    ap.add_argument("--tp-fused-norm", type=int, default=1,
+                    help="--tp: 1 = fla's fused Triton RMSNorm for the (replicated) input/post-attention/final norms (same fp32 math, "
+                         "saves the bf16 input instead of ~4 fp32 copies); 0 = HF's eager norm.")
     ap.add_argument("--suffix-ckpt", action="store_true",
                     help="--prefix-cache: EXACT per-decoder-layer activation checkpointing of the SUFFIX forward (the cache "
                          "slots are snapshotted and restored for the recompute, which HF's own checkpointing cannot do); the "
@@ -596,12 +605,19 @@ def main():
     assert not a.prefix_head_on_labels or a.prefix_cache, "--prefix-head-on-labels is a --prefix-cache knob"
     assert a.pad_multiple >= 1, "--pad-multiple must be >= 1"
     assert not (a.length_bucket and a.pack_len), "--length-bucket is for the per-example path (no --pack-len)"
+    assert not a.tp or a.full_ft, "--tp is a --full-ft knob"
 
     world = int(os.environ.get("WORLD_SIZE", 1)); rank = int(os.environ.get("RANK", 0))
     local = int(os.environ.get("LOCAL_RANK", 0)); is_main = rank == 0
     if world > 1:
         dist.init_process_group(os.environ.get("DDP_BACKEND", "nccl")); torch.cuda.set_device(local)
     device = f"cuda:{local}"
+    # data-parallel view of the ranks: FSDP2/DDP shard the examples across the world; --tp ranks all run the same examples
+    if a.tp:
+        assert a.tp == world, f"--tp {a.tp} must equal the world size {world} (single-node tensor parallelism, no DP x TP)"
+        dp_world, dp_rank = 1, 0
+    else:
+        dp_world, dp_rank = world, rank
 
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
@@ -610,7 +626,7 @@ def main():
     # flat arrays (~100 B/row) -- 200M-record corpora would otherwise put ~640 GB of dicts + token lists in host RAM.
     data_dirs = parse_data_dirs(a.data_dir)
     t_load = time.time()
-    toks_cache, vecs, bank = load_shard(data_dirs, rank, world, tok, a.max_seq, a.max_examples, a.max_examples_seed)
+    toks_cache, vecs, bank = load_shard(data_dirs, dp_rank, dp_world, tok, a.max_seq, a.max_examples, a.max_examples_seed)
     vec_file = bank["vec_files"][0] if len(data_dirs) == 1 else "+".join(bank["vec_files"])
     if is_main:
         if len(data_dirs) > 1:
@@ -623,7 +639,8 @@ def main():
                   f"records, {bank['n_vecs']} vectors" + ("" if n_stats is None else
                   f" (build_stats.json n_examples sum = {n_stats}" + ("" if n_stats == bank["n_lines"] else
                   " -- MISMATCH with the line counts, which define the sharding") + ")"), flush=True)
-        print(f"{len(toks_cache)*world} records, {len(vecs)} vectors ({vec_file}), world={world}", flush=True)
+        print(f"{len(toks_cache)*dp_world} records, {len(vecs)} vectors ({vec_file}), world={world}"
+              + (f" (tensor-parallel: every rank holds all {len(toks_cache)} records)" if a.tp else ""), flush=True)
         print(f"[pretrain] loaded + tokenized {len(toks_cache)} local records in {time.time() - t_load:.1f}s "
               f"({toks_cache.nbytes() / 2**20:.0f} MB of tokenized rows on this rank)", flush=True)
 
@@ -644,11 +661,28 @@ def main():
         src = a.init_adapter or MODEL   # a full model dir (our own checkpoints load like the base repo) or the base
         model = AutoModelForCausalLM.from_pretrained(src, dtype=torch.bfloat16, attn_implementation="sdpa",
                                                      device_map={"": device})
-        model = FT.shard_full_model(model, world, device, log=print if is_main else (lambda *x, **k: None),
-                                    keep_unsharded_layers=a.fsdp_keep_unsharded, prefetch=a.fsdp_prefetch)
+        tpm = None
+        if a.tp:
+            try:
+                from sft import tp as TPM
+            except ImportError:  # mounted next to this file (modal_sft.py puts both under /pmx/SL/)
+                import sys
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                import tp as TPM
+            assert not a.prefix_head_on_labels, "--tp's LM head is already label-only + vocab-parallel; drop --prefix-head-on-labels"
+            if (a.fsdp_keep_unsharded or a.fsdp_prefetch) and is_main:
+                print("[tp] --fsdp-keep-unsharded / --fsdp-prefetch ignored under --tp (no FSDP)", flush=True)
+            tpm = TPM.shard_model_tp(model, a.tp, device, log=print if is_main else (lambda *x, **k: None),
+                                     fused_norm=bool(a.tp_fused_norm))
+            master_params = tpm.build_masters()
+            model.no_sync = FT.FSDPNoSync()   # pretrain.py calls ddp.no_sync() for grad accumulation: a no-op here too
+        else:
+            model = FT.shard_full_model(model, world, device, log=print if is_main else (lambda *x, **k: None),
+                                        keep_unsharded_layers=a.fsdp_keep_unsharded, prefetch=a.fsdp_prefetch)
         if is_main:
             print(f"[fullft] kernel backends: {FT.kernel_backends(model)} | optim {a.optim} | suffix_ckpt {a.suffix_ckpt} | "
-                  f"prefix_head_on_labels {a.prefix_head_on_labels} ce_chunk {a.ce_chunk} | prefix_share_step {a.prefix_share_step}", flush=True)
+                  f"prefix_head_on_labels {a.prefix_head_on_labels} ce_chunk {a.ce_chunk} | prefix_share_step {a.prefix_share_step}"
+                  f" | tp {a.tp or 'off'}", flush=True)
         nontext_shard = "/tmp/base_nontext.safetensors"
         if is_main:
             FT.prepare_nontext_shard(MODEL, nontext_shard)
@@ -685,6 +719,8 @@ def main():
               f"compile_mode={a.compile_mode} head_on_labels={a.head_on_labels} grad_accum={a.grad_accum} "
               f"fla={_fla} gpu={torch.cuda.get_device_name(0)}", flush=True)
     n_params = sum(p.numel() for p in model.parameters())  # full model incl. lm_head; LoRA adds <0.2%, fine for MFU
+    if a.tp:
+        n_params = sum(math.prod(s.full_shape) for s in tpm.specs.values())   # each rank holds 1/tp: count the FULL model
     submodule = get_layer(model, INJECT_LAYER)
     persistent_injector = persistent_handle = None
     if a.compile and not a.pack_len:
@@ -712,7 +748,7 @@ def main():
     else:
         ddp = DDP(train_mod, device_ids=[local]) if world > 1 else train_mod
     if a.full_ft:
-        opt = FT.make_optimizer(a.optim, model.parameters(), a.lr)
+        opt = FT.make_optimizer(a.optim, master_params if a.tp else model.parameters(), a.lr)
     else:
         opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
     prefix_cache = None
@@ -734,9 +770,10 @@ def main():
                                    prefix_model=model, persistent_injector=persistent_injector, pad_multiple=a.pad_multiple,
                                    # FSDP2 registers backward hooks on the layer output: inject on a clone, never in place;
                                    # and its pre-backward unshard hangs on module outputs -> the prefix output needs a grad path
-                                   inject_mode="add_clone" if a.full_ft else "add", keep_prefix_grad_path=a.full_ft)
+                                   # (TP has neither: plain autograd through the sharded modules, no zero-weight logits term)
+                                   inject_mode="add_clone" if a.full_ft else "add", keep_prefix_grad_path=a.full_ft and not a.tp)
         assert a.prefix_accum >= 1 and a.batch_size % a.prefix_accum == 0, "--prefix-accum must divide --batch-size"
-        assert not (a.full_ft and a.prefix_accum > 1), \
+        assert not (a.full_ft and not a.tp and a.prefix_accum > 1), \
             "--prefix-accum > 1 retains the prefix graph across backwards, which FSDP2's one-shot unshard hooks cannot do; use --prefix-share-step"
         if a.suffix_ckpt:
             prefix_cache.suffix_ckpt = SuffixCheckpointer(model)
@@ -805,7 +842,8 @@ def main():
         """LoRA: rank 0 writes the adapter. --full-ft: COLLECTIVE full-model save (every rank all-gathers), rank 0 writes."""
         if a.full_ft:
             FT.save_full_ckpt(model, path, tok, MODEL, is_main, world, nontext_shard=nontext_shard, log=print,
-                              extra_meta={"step": at_step, "run_name": a.run_name, "lr": a.lr, "full_ft": True})
+                              extra_meta={"step": at_step, "run_name": a.run_name, "lr": a.lr, "full_ft": True, "tp": a.tp},
+                              gather=tpm.gather_full if a.tp else None)
         elif is_main:
             model.save_pretrained(path)
 
@@ -984,11 +1022,16 @@ def main():
                 if not a.full_ft:
                     sync_accumulated_gradients(model.parameters())   # FSDP2 reduce-scattered every backward already
             probe_ctx.__exit__(None, None, None)
-            if a.full_ft:
+            if a.tp:
+                tpm.reduce_grads()                    # complete the group-replicated grads (kv heads, per-head norm weights)
+                tpm.clip_grad_norm(1.0)               # global norm over the full parameter set from the local shards
+            elif a.full_ft:
                 FT.clip_grad_norm([p for p in model.parameters() if p.requires_grad], 1.0)
             else:
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step(); sched.step(); opt.zero_grad()
+            if a.tp:
+                tpm.sync_params()                     # fp32 masters -> bf16 module params
             prof.__exit__(None, None, None)
             if a.full_ft and is_main and step == a.skip_steps:
                 print(f"[optim] {a.optim}: state {FT.optimizer_state_gb(opt):.1f} GB on rank 0 after the first step | "
@@ -999,29 +1042,35 @@ def main():
                 # MFU = 6·N·(real tokens this rank, all micro-batches) / step wall time. N is the full model
                 # (lm_head included), so with --head-on-labels the skipped head FLOPs (~2-3% of 6ND) are
                 # still credited -- the number is throughput in "nominal 6ND" units, not hardware FLOPs.
+                # --tp: every rank ran ALL the step's tokens through 1/tp of the model, so 6ND x tokens is the NODE's work;
+                # divide by tp for the per-GPU number (comparable to the FSDP2/DDP print, which is per rank).
                 tfl, m = mfu(n_real_step, dt, n_params, fwd_bwd=True)
+                if a.tp:
+                    tfl, m = tfl / a.tp, m / a.tp
                 peak_gb = torch.cuda.max_memory_allocated() / 2**30
                 pad_frac = 1.0 - n_pad_real / max(n_pad_slots, 1)   # fraction of padded-tensor slots that were padding
                 print(f"ep{ep} step {step}/{steps_total} loss {loss_step.item():.4f} | "
                       f"{tfl:.0f} TFLOP/s MFU {m:.0%} | {n_ex_step / dt:.2f} ex/s {n_real_step / dt:.0f} tok/s "
                       f"pad {pad_frac:.1%} ({dt:.3f} s/step, {len(group)} micro) | peak {peak_gb:.1f} GB"
+                      + (f" | TP{a.tp}: ex/s and tok/s are NODE totals, TFLOP/s per GPU" if a.tp else "")
                       + (" | PROFILED" if profiling else ""), flush=True)
                 if profiling:
                     print(prof.report(), flush=True)
                 if not a.no_wandb:
                     wandb.log({"loss": loss_step.item(), "lr": sched.get_last_lr()[0], "mfu": m, "tflops": tfl,
                                "ex_per_s": n_ex_step / dt, "tok_per_s": n_real_step / dt, "pad_frac": pad_frac,
-                               "peak_mem_gb": peak_gb}, step=step)
+                               "peak_mem_gb": peak_gb, "ex_per_s_node": n_ex_step / dt * dp_world,
+                               "tflops_node": tfl * world}, step=step)
             if step % save_every == 0 and step:
                 save_ckpt(f"{a.save_dir}/step_{step}", step)
-            global_seen = min((step + 1) * a.batch_size * a.grad_accum * world, len(toks_cache) * world)
+            global_seen = min((step + 1) * a.batch_size * a.grad_accum * dp_world, len(toks_cache) * dp_world)
             for requested in save_examples:
                 if requested <= global_seen and requested not in saved_examples:
                     path = f"{a.save_dir}/examples_{requested}"
                     save_ckpt(path, step + 1)
                     if is_main:
                         json.dump({"requested_examples": requested, "actual_examples": global_seen,
-                                   "step": step + 1, "world_size": world,
+                                   "step": step + 1, "world_size": world, "dp_world": dp_world, "tp": a.tp,
                                    "batch_size_per_rank": a.batch_size, "grad_accum": a.grad_accum},
                                   open(f"{path}/training_progress.json", "w"), indent=2)
                         print(f"SAVED_SCALING_POINT requested={requested} actual={global_seen} "
