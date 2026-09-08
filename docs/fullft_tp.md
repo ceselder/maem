@@ -167,7 +167,7 @@ rank = TP mb 256, DP-emulating loss normalisation; step 0 compared before the op
 | TP-8, eager HF norm (`--tp-fused-norm 0`) | 5.6052 (+3.5e-4) | 78.7 | 0.9907 / 0.9938 / 0.69 | 816 | 0.05 / 0.29 |
 | TP-8, fused norm, fp32 activation all-reduces (`--tp-reduce-fp32 1`) | 5.6080 (+4.1e-3) | 79.6 | 0.9943 / 0.9952 / 0.85 | 791 | 0.12 / 0.34 |
 | TP-8, eager norm, fp32 all-reduces | 5.6047 (+7.9e-4) | 79.0 | 0.9950 / 0.9956 / 0.78 | 796 | 0.063 / 0.31 |
-| FSDP2 re-run with each rank's micro-batch as 2 halves (`--split 2`: same objective, different GEMM shapes) | v4 -- see run report | | | | |
+| FSDP2 re-run with each rank's micro-batch as 2 halves (`--split 2`: same objective and kernels, GEMM M halved) | 5.6039 (0.0) | 76.5 | 0.99997 / 0.99998 / 0.998 | 1 | 0.095 / 0.69 |
 
 Reading: the bf16 FSDP2 path is itself only reproducible to ~1e-3 in loss and 0.9997 in gradient cosine, and its 20-step
 trace wanders by up to 1.2 in loss on the same data (chaotic after a few steps) -- every TP trace sits inside that band.
@@ -176,9 +176,14 @@ norm shifts it by +4-5e-3 (its bf16 output rounds differently), i.e. right at th
 ~20x further from the reference than a re-run (median cos 0.994-0.996 vs 0.9997) in all four TP variants -- neither the
 norm kernel nor the bf16 accumulation of the partial GEMM sums (fp32 all-reduces: 0.9943 -> 0.9952) explains it. What
 remains is that TP computes every activation with different GEMM shapes (K split 8-way, M 8x larger, different tiles),
-so every bf16 activation element is rounded differently -- a re-implementation-level bf16 perturbation that the FSDP2
-re-run (identical kernels and shapes) does not have. The `--split 2` FSDP2 control leg (same objective and code, GEMM M
-halved) measures that floor directly. The CPU/gloo unit test (deterministic fp32 torch kernels) matches the single-process
+so the bf16 rounding STRUCTURE differs: every row-parallel output (out_proj / o_proj / down_proj, 128 per forward) is the
+sum of 8 partial GEMMs each rounded to bf16 before the reduce, and every column-parallel input gradient (128 per backward)
+likewise, where the full model rounds the complete K=6144 / 17408 sum once. The `--split 2` FSDP2 control (same code, GEMM
+M halved: only the fp32 accumulation order inside each GEMM changes) stays at cos 0.99997, so tile-order noise is NOT the
+explanation -- the 8-way partial rounding is the one structural difference left. Fix (not implemented here): compute the
+row-parallel partials and the column-parallel backward dX partials with an fp32 GEMM output (`torch.mm(..., out_dtype=
+torch.float32)`), all-reduce in fp32, round to bf16 once -- a custom autograd linear for the 3 row-parallel and 4
+column-parallel projection groups (~80 lines), at +232 MB of transient fp32 per [11k, 5120] output. The CPU/gloo unit test (deterministic fp32 torch kernels) matches the single-process
 reference to 1e-6 relative, so the sharding arithmetic itself is exact; on GPU the same test at fp32 gives global cos
 1.0000000 with per-param deviations only on the fla g-path parameters (A_log / dt_bias / in_proj_a, rel 3e-3: fla's
 chunk backward accumulates dg with atomics).

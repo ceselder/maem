@@ -1,0 +1,242 @@
+{
+ "data_dir": "/data/banks/realact_short_smoke3",
+ "n_records": 8192,
+ "batch_size": 32,
+ "steps": 20,
+ "lr": 1e-05,
+ "rc": {
+  "fsdp": 0,
+  "fsdp-split2": 0
+ },
+ "summaries": {
+  "fsdp-split2": {
+   "step0_loss_fsdp": 5.603896081447601,
+   "step0_loss_tp": 5.603896260261536,
+   "step0_abs_diff": 1.7881393432617188e-07,
+   "max_abs_diff": 0.6940956711769104,
+   "mean_abs_diff": 0.09472434222698212,
+   "fsdp_gnorm0": 76.4084243774414,
+   "tp_gnorm0": 76.48567199707031,
+   "fsdp_peak_gb": 85.76332521438599,
+   "tp_peak_gb": 80.77512264251709,
+   "fsdp_mean_dt": 1.5998077894511975,
+   "tp_mean_dt": 2.007404352489271,
+   "grad_compare": {
+    "label": "fsdp-rerun",
+    "global_cos": 0.9999693708556807,
+    "worst_cos": 0.9981257360009016,
+    "worst_name": "model.layers.14.input_layernorm.weight",
+    "max_abs": 0.020487874746322632,
+    "n_params": 851,
+    "n_cos_below_0999": 1,
+    "n_cos_below_099": 0,
+    "median_cos": 0.9999764391235232,
+    "median_cos_proj": 0.9999737290093622,
+    "worst20": [
+     [
+      "model.layers.14.input_layernorm.weight",
+      {
+       "cos": 0.9981257360009016,
+       "max_abs": 0.002460956573486328,
+       "rel": 0.06999025539753778,
+       "norm_ref": 0.03565138024969075,
+       "norm_tp": 0.036795459015240874
+      }
+     ],
+     [
+      "model.layers.16.input_layernorm.weight",
+      {
+       "cos": 0.9997085504358546,
+       "max_abs": 0.000858306884765625,
+       "rel": 0.0256221734724481,
+       "norm_ref": 0.03633972549039711,
+       "norm_tp": 0.03664106715602448
+      }
+     ],
+     [
+      "model.layers.1.input_layernorm.weight",
+      {
+       "cos": 0.9997330189685446,
+       "max_abs": 0.0010089874267578125,
+       "rel": 0.03322525948382116,
+       "norm_ref": 0.030951324055943908,
+       "norm_tp": 0.030204090350231298
+      }
+     ],
+     [
+      "model.layers.20.linear_attn.norm.weight",
+      {
+       "cos": 0.9997480334135651,
+       "max_abs": 0.0008971691131591797,
+       "rel": 0.02254349554701178,
+       "norm_ref": 0.04573466576319996,
+       "norm_tp": 0.04581841423506382
+      }
+     ],
+     [
+      "model.layers.5.input_layernorm.weight",
+      {
+       "cos": 0.9997726311998424,
+       "max_abs": 0.00096893310546875,
+       "rel": 0.03222423799763195,
+       "norm_ref": 0.030692039268623635,
+       "norm_tp": 0.029943534829098815
+      }
+     ],
+     [
+      "model.layers.13.post_attention_layernorm.weight",
+      {
+       "cos": 0.9997764197745688,
+       "max_abs": 0.0008935928344726562,
+       "rel": 0.021171747488419736,
+       "norm_ref": 0.048461522869774294,
+       "norm_tp": 0.04839911718902039
+      }
+     ],
+     [
+      "model.layers.5.post_attention_layernorm.weight",
+      {
+       "cos": 0.9997865648230997,
+       "max_abs": 0.0011749267578125,
+       "rel": 0.030884266323023844,
+       "norm_ref": 0.0391280793261319,
+       "norm_tp": 0.04001798218034337
+      }
+     ],
+     [
+      "model.layers.0.linear_attn.dt_bias",
+      {
+       "cos": 0.9998314867136101,
+       "max_abs": 7.258524419739842e-06,
+       "rel": 0.018418084114637932,
+       "norm_ref": 0.0010171356324503184,
+       "norm_tp": 0.0010184823372325084
+      }
+     ],
+     [
+      "model.layers.20.linear_attn.in_proj_b.weight",
+      {
+       "cos": 0.9998375732591755,
+       "max_abs": 0.009556770324707031,
+       "rel": 0.019141556828016066,
+       "norm_ref": 0.6652190411668758,
+       "norm_tp": 0.6694000866147853
+      }
+     ],
+     [
+      "model.layers.0.linear_attn.A_log",
+      {
+       "cos": 0.9998438612956686,
+       "max_abs": 6.677210330963135e-05,
+       "rel": 0.017741520087588433,
+       "norm_ref": 0.00797612918555771,
+       "norm_tp": 0.007962251000152003
+      }
+     ],
+     [
+      "model.layers.15.self_attn.q_norm.weight",
+      {
+       "cos": 0.999843904348875,
+       "max_abs": 0.00019788742065429688,
+       "rel": 0.018802765440266763,
+       "norm_ref": 0.013566611049804065,
+       "norm_tp": 0.013651760581708083
+      }
+     ],
+     [
+      "model.layers.0.linear_attn.in_proj_a.weight",
+      {
+       "cos": 0.9998511554664383,
+       "max_abs": 7.806718349456787e-05,
+       "rel": 0.019836613585118436,
+       "norm_ref": 0.06238714556131961,
+       "norm_tp": 0.06298856672256034
+      }
+     ],
+     [
+      "model.layers.15.self_attn.k_norm.weight",
+      {
+       "cos": 0.9998672199976251,
+       "max_abs": 0.00016365759074687958,
+       "rel": 0.017174427873887135,
+       "norm_ref": 0.01348466133893679,
+       "norm_tp": 0.01355601018505553
+      }
+     ],
+     [
+      "model.layers.23.input_layernorm.weight",
+      {
+       "cos": 0.9998714493908061,
+       "max_abs": 0.001071929931640625,
+       "rel": 0.018319434495951095,
+       "norm_ref": 0.06737833891924305,
+       "norm_tp": 0.06796671558450175
+      }
+     ],
+     [
+      "model.layers.20.linear_attn.conv1d.weight",
+      {
+       "cos": 0.9998857812289835,
+       "max_abs": 0.020487874746322632,
+       "rel": 0.015247301193761307,
+       "norm_ref": 2.5137779136673175,
+       "norm_tp": 2.5185532307052454
+      }
+     ],
+     [
+      "model.layers.31.post_attention_layernorm.weight",
+      {
+       "cos": 0.9998955975117828,
+       "max_abs": 0.0016968250274658203,
+       "rel": 0.01687500707019104,
+       "norm_ref": 0.11233356565343322,
+       "norm_tp": 0.11330095728458714
+      }
+     ],
+     [
+      "model.layers.0.linear_attn.in_proj_qkv.weight",
+      {
+       "cos": 0.9998959200399911,
+       "max_abs": 0.0007982105016708374,
+       "rel": 0.014488670596441043,
+       "norm_ref": 1.0532983544885286,
+       "norm_tp": 1.0545910342020037
+      }
+     ],
+     [
+      "model.layers.6.input_layernorm.weight",
+      {
+       "cos": 0.9998964981605393,
+       "max_abs": 0.00039768218994140625,
+       "rel": 0.015058640153752523,
+       "norm_ref": 0.031685457165204496,
+       "norm_tp": 0.0318230610427361
+      }
+     ],
+     [
+      "model.layers.27.self_attn.q_norm.weight",
+      {
+       "cos": 0.9999026070204197,
+       "max_abs": 0.0003287792205810547,
+       "rel": 0.0147053201048186,
+       "norm_ref": 0.038723199343388234,
+       "norm_tp": 0.03889885460814423
+      }
+     ],
+     [
+      "model.layers.21.linear_attn.in_proj_b.weight",
+      {
+       "cos": 0.9999056500986383,
+       "max_abs": 0.001968860626220703,
+       "rel": 0.01443230073275714,
+       "norm_ref": 0.46754749464055384,
+       "norm_tp": 0.4695733238896
+      }
+     ]
+    ]
+   },
+   "tag": "fsdp-split2"
+  }
+ },
+ "wall_min": 9.956536789735159
+}
