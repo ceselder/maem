@@ -777,7 +777,7 @@ def run_fullft_smoke(args: str = ""):
     secrets=[modal.Secret.from_name("maemm-hf"), modal.Secret.from_name("maemm-wandb")],
     timeout=int(os.environ.get("SFT_TPX_TIMEOUT_S", str(75 * 60))),   # hard cap: the container MUST exit
     memory=256 * 1024,
-    ephemeral_disk=400 * 1024,   # the fp32 reference gradient dump is 108 GB
+    ephemeral_disk=600 * 1024,   # the fp32 reference gradient dump is 108 GB (Modal minimum for the knob is 512 GiB)
 )
 def tp_exactness(data_dir: str = "/data/banks/realact_short_smoke3", n_records: int = 8192, batch_size: int = 32,
                  steps: int = 20, lr: float = 1e-5, max_seq: int = 160, unit_test: bool = True) -> dict:
