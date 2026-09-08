@@ -165,16 +165,29 @@ rank = TP mb 256, DP-emulating loss normalisation; step 0 compared before the op
 | FSDP2 **re-run** (noise floor: fla atomics, NCCL order) | 5.6039 (-9e-4) | 76.4 | 0.99972 / 0.99972 / 0.992 | 23 | 0.14 / 1.24 |
 | TP-8, fused norm (production default) | 5.6100 (+5.1e-3; v1 run 5.6099) | 79.9 (v1 77.8) | 0.9926 / 0.9939 / 0.86 | 819 | 0.065 / 0.20 (v1: 0.18 / 2.1) |
 | TP-8, eager HF norm (`--tp-fused-norm 0`) | 5.6052 (+3.5e-4) | 78.7 | 0.9907 / 0.9938 / 0.69 | 816 | 0.05 / 0.29 |
-| TP-8, fused norm, fp32 activation all-reduces (`--tp-reduce-fp32 1`) | see run report (v3) | | | | |
+| TP-8, fused norm, fp32 activation all-reduces (`--tp-reduce-fp32 1`) | 5.6080 (+4.1e-3) | 79.6 | 0.9943 / 0.9952 / 0.85 | 791 | 0.12 / 0.34 |
+| TP-8, eager norm, fp32 all-reduces | 5.6047 (+7.9e-4) | 79.0 | 0.9950 / 0.9956 / 0.78 | 796 | 0.063 / 0.31 |
+| FSDP2 re-run with each rank's micro-batch as 2 halves (`--split 2`: same objective, different GEMM shapes) | v4 -- see run report | | | | |
 
 Reading: the bf16 FSDP2 path is itself only reproducible to ~1e-3 in loss and 0.9997 in gradient cosine, and its 20-step
-trace wanders by up to 1.2 in loss on the same data (chaotic after a few steps) -- the TP traces sit inside that band.
-TP's step-0 gradient, however, is ~25x further from the reference than a re-run (median cos 0.994 vs 0.9997) with either
-norm, so the difference is not the fused norm; the fused norm shifts the loss by +5e-3 (its bf16 output rounding differs
-from HF's eager norm), the eager norm is within 4e-4. The remaining candidate is the bf16 accumulation of the tp partial
-GEMM sums inside NCCL (up to 7 extra bf16 roundings per row-parallel output, 128 times per forward) -- tested by the
-`--tp-reduce-fp32` leg. The CPU/gloo unit test (deterministic fp32 kernels) matches the single-process reference to
-1e-6, so the sharding arithmetic itself is exact.
+trace wanders by up to 1.2 in loss on the same data (chaotic after a few steps) -- every TP trace sits inside that band.
+The step-0 LOSS matches to within the FSDP2 re-run noise once HF's eager norm is used (+3.5e-4 / +7.9e-4); the fused fla
+norm shifts it by +4-5e-3 (its bf16 output rounds differently), i.e. right at the 5e-3 tolerance. The step-0 GRADIENT is
+~20x further from the reference than a re-run (median cos 0.994-0.996 vs 0.9997) in all four TP variants -- neither the
+norm kernel nor the bf16 accumulation of the partial GEMM sums (fp32 all-reduces: 0.9943 -> 0.9952) explains it. What
+remains is that TP computes every activation with different GEMM shapes (K split 8-way, M 8x larger, different tiles),
+so every bf16 activation element is rounded differently -- a re-implementation-level bf16 perturbation that the FSDP2
+re-run (identical kernels and shapes) does not have. The `--split 2` FSDP2 control leg (same objective and code, GEMM M
+halved) measures that floor directly. The CPU/gloo unit test (deterministic fp32 torch kernels) matches the single-process
+reference to 1e-6 relative, so the sharding arithmetic itself is exact; on GPU the same test at fp32 gives global cos
+1.0000000 with per-param deviations only on the fla g-path parameters (A_log / dt_bias / in_proj_a, rel 3e-3: fla's
+chunk backward accumulates dg with atomics).
+
+Wall-clock for a 104M-example run (eff batch 4,096, 25.4k steps, excluding the ~4 min kernel JIT per leg and checkpoint
+saves): FSDP2 629 ex/s -> 45.9 h; TP-8 mb 512 x 8 at 696 ex/s -> 41.5 h (36-38 h at the 750-810 ex/s warm steps, but
+166.7 GB peak: not safe for the longest length buckets); TP-8 mb 256 x 16 at 607-613 ex/s -> 47-48 h. Under TP every rank
+also tokenizes the WHOLE bank at start-up (load_shard with world 1): ~8x the FSDP2 start-up tokenization (~15-20 min for
+104M rows vs 2-3 min), an easy follow-up (tokenize the shard, all-gather the flat TokRows arrays).
 
 ## 10. Risks / not done
 
