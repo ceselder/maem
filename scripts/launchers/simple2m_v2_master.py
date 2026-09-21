@@ -34,8 +34,10 @@ def discord(m): subprocess.run(["notify-discord", f"simple2m-v2: {m}"])
 def load(): return json.load(open(IDS))
 def save(d): json.dump(d, open(IDS, "w"), indent=1)
 def vol_has(path):
-    r = subprocess.run(["modal", "volume", "ls", "maemm-data", os.path.dirname(path)], capture_output=True, text=True)
-    return os.path.basename(path) in r.stdout
+    """`path` may be the container path (/data/...) or the volume-root path; `modal volume ls` wants the latter."""
+    vpath = path[len("/data"):] if path.startswith("/data/") else path
+    r = subprocess.run(["modal", "volume", "ls", "maemm-data", os.path.dirname(vpath)], capture_output=True, text=True)
+    return os.path.basename(vpath) in r.stdout
 
 
 def wait_call(fc_id, what, poll=120, allow_fail=False):
