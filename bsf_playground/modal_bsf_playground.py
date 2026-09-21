@@ -29,8 +29,8 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("torch==2.10.0", index_url="https://download.pytorch.org/whl/cu128")
     .pip_install("vllm==0.19.0", "vllm-lens==1.1.0")
-    .pip_install("transformers==5.15.0", "peft==0.20.0", "accelerate==1.14.0", "numpy==2.4.6", "safetensors==0.8.0",
-                 "huggingface_hub==1.27.0", "tokenizers==0.22.2", "hf_xet")
+    .pip_install("transformers==5.15.0", "peft==0.20.0", "accelerate==1.14.0", "wandb==0.28.2", "numpy==2.4.6", "safetensors==0.8.0",
+                 "huggingface_hub==1.27.0", "tokenizers==0.22.2", "hf_xet")            # wandb: rl_hf imports it at module level
     .pip_install("flash-linear-attention==0.5.2")
     .pip_install("gradio>=5.0,<6", "fastapi[standard]", "anthropic")
     .env({"PYTHONPATH": "/pmx/helpers:/pmx/eval:/pmx/RL:/pmx/bsf_playground", "HF_HOME": "/data/hf_cache", "HF_HUB_OFFLINE": "1",
