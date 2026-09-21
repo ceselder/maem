@@ -27,10 +27,12 @@ image = (modal.Image.debian_slim(python_version="3.11")
 vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
 
 V2 = "/data/eval_universal_ho/eval_sets_heldout_v2.pt"
-V3 = "/data/eval_universal_ho/eval_sets_heldout_v3.pt"
-AE = "/data/sae2m/trainer_0/ae.pt"
-MAXACTS = "/data/sae2m/maxacts_top5.pt"
-SPLIT = "/data/sae2m/feature_split.npz"
+# Deploy-time knobs (2026-09-21, the v2 SAE rerun): EVAL_V3_OUT / EVAL_V3_AE / EVAL_V3_MAXACTS / EVAL_V3_SPLIT point a fresh deployment
+# (EVAL_V3_APP=maemm-eval-cache-v4-s2m) at another SAE's files; defaults = the original v3 build.
+V3 = os.environ.get("EVAL_V3_OUT", "/data/eval_universal_ho/eval_sets_heldout_v3.pt")
+AE = os.environ.get("EVAL_V3_AE", "/data/sae2m/trainer_0/ae.pt")
+MAXACTS = os.environ.get("EVAL_V3_MAXACTS", "/data/sae2m/maxacts_top5.pt")
+SPLIT = os.environ.get("EVAL_V3_SPLIT", "/data/sae2m/feature_split.npz")
 FAM_ENC, FAM_DEC = "sae2m_enc", "sae2m_dec"
 
 
