@@ -411,6 +411,79 @@ class Playground:
             self.stats = self.torch.load(STATS, map_location="cpu", weights_only=False); return f"stats loaded: {self.stats['n_kept']:,} tokens, created {self.stats['created']}"
         return "stats file not present yet"
 
+    def ui_text_pc(self, texts, g, pc):
+        """Score arbitrary texts (one per line) on block g: activation, whether it is in the top-k anywhere, PC score at the block's peak
+        token and the activation-weighted mean PC score over kept tokens. The forward test of a claimed PC semantics."""
+        st = self.stats
+        if st is None:
+            return "stats not ready", []
+        g = int(g) % self.bsf.G; pc_i = int(pc) - 1; torch = self.torch
+        lines = [t for t in str(texts).split("\n") if t.strip()]
+        m = st["mean_c"][g].cuda(); V = st["V"][g].cuda(); lam = st["lam"][g].cuda().clamp(min=1e-6).sqrt()
+        rows = []
+        for toks, h, keep in self.read(lines):
+            if not keep.any():
+                rows.append(["", 0, "", None, None, ""]); continue
+            y = (h - self.bsf.mu) @ self.bsf.zca; gn = self.bsf.encode(y); gb = gn[:, g].clone(); gb[~keep] = -1
+            pk = int(gb.argmax()); rank = int((gn[pk] > gn[pk, g]).sum()) + 1
+            sc = ((self.bsf.Q[g] @ y.T).T - m) @ V / lam                             # [T, b] sigma units
+            w = gb.clamp(min=0) * keep; wmean = float((sc[:, pc_i] * w).sum() / w.sum().clamp(min=1e-6))
+            rows.append([round(float(gb[pk]), 3), rank, "yes" if rank <= self.bsf.k else "no", round(float(sc[pk, pc_i]), 2), round(wmean, 2), toks[pk]])
+        table = [[lines[i][:120]] + r for i, r in enumerate(rows)]
+        return f"block {g}, PC{pc_i + 1}: {len(lines)} texts (PC score at the block's peak token; act-weighted mean over tokens)", table
+
+    def ui_pc_extremes(self, g, pc, n_seq, n_show):
+        """Corpus check of a PC: scan n_seq stored sequences, keep tokens where block g is active (top-k), sort by their PC score and show
+        the contexts at both tails. Cached per (block, pc, n_seq)."""
+        st = self.stats
+        if st is None:
+            return "stats not ready", "", ""
+        import numpy as np
+        torch = self.torch
+        g = int(g) % self.bsf.G; pc_i = int(pc) - 1; n_seq = int(n_seq); n_show = int(n_show)
+        key = (g, pc_i, n_seq)
+        cache = getattr(self, "_ext_cache", {}); self._ext_cache = cache
+        if key not in cache:
+            meta = json.load(open(f"{ACTS_DIR}/meta.json")); N, L = int(meta["n_seq"]), int(meta["seq_len"])
+            acts = np.memmap(f"{ACTS_DIR}/acts.f16", np.float16, "r", shape=(N, L, D)); toks = np.memmap(f"{ACTS_DIR}/toks.i32", np.int32, "r", shape=(N, L))
+            rng = np.random.default_rng(g * 7 + pc_i); sid = np.sort(rng.choice(N, size=min(n_seq, N), replace=False))
+            m = st["mean_c"][g].cuda(); V = st["V"][g].cuda(); lam = st["lam"][g].cuda().clamp(min=1e-6).sqrt()
+            found = []                                                                # (score, gn, seq, pos)
+            t0 = time.time()
+            for s0 in range(0, len(sid), 16):
+                ss = sid[s0:s0 + 16]
+                x = torch.from_numpy(np.ascontiguousarray(acts[ss])).cuda().float().view(-1, D)
+                xc = x - self.bsf.mu; nrm = xc.norm(dim=-1).view(len(ss), L)
+                keep = (nrm <= 10.0 * nrm.median(dim=1, keepdim=True).values).view(-1)
+                y = xc @ self.bsf.zca
+                gn = self.bsf.encode(y); gb = gn[:, g]
+                kth = gn.topk(self.bsf.k, dim=-1).values[:, -1]
+                act = keep & (gb >= kth)                                              # block g active at this token
+                if act.any():
+                    idx = torch.nonzero(act).squeeze(1)
+                    sc = ((self.bsf.Q[g] @ y[idx].T).T - m) @ V / lam
+                    for j, i in enumerate(idx.tolist()):
+                        found.append((float(sc[j, pc_i]), float(gb[i]), int(ss[i // L]), int(i % L)))
+            cache[key] = {"found": found, "wall": time.time() - t0, "n_tok": len(sid) * L}
+        found = cache[key]["found"]
+        if not found:
+            return f"block {g} never active in {n_seq} sequences", "", ""
+        found.sort(key=lambda t: t[0])
+        scores = np.array([f[0] for f in found])
+        def render(items, title):
+            out = [f'<div style="font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.55"><b>{title}</b>']
+            meta = json.load(open(f"{ACTS_DIR}/meta.json")); N, L = int(meta["n_seq"]), int(meta["seq_len"])
+            toks = np.memmap(f"{ACTS_DIR}/toks.i32", np.int32, "r", shape=(N, L))
+            for sc, gv, s, p in items:
+                row = toks[s].tolist(); lo, hi = max(0, p - 18), min(L, p + 6)
+                out.append(f'<div><span style="color:#888">PC {sc:+.2f}σ · act {gv:.2f}</span> …{_esc(self.tok.decode(row[lo:p]))}<mark style="background:#f7c9a3">{_esc(self.tok.decode([row[p]]))}</mark>{_esc(self.tok.decode(row[p + 1:hi]))}…</div>')
+            out.append("</div>"); return "".join(out)
+        neg = render(found[:n_show], f"NEGATIVE tail of PC{pc_i + 1} (lowest scores)")
+        pos = render(found[::-1][:n_show], f"POSITIVE tail of PC{pc_i + 1} (highest scores)")
+        summ = (f"block {g}, PC{pc_i + 1}: {len(found):,} active tokens in {n_seq} sequences ({cache[key]['n_tok']:,} tokens, scan {cache[key]['wall']:.0f}s); "
+                f"PC score quantiles: 5% {np.quantile(scores, .05):+.2f}, 50% {np.quantile(scores, .5):+.2f}, 95% {np.quantile(scores, .95):+.2f} σ")
+        return summ, neg, pos
+
     # ------------------------------------------------------------------------------------------------------------ web app
     @modal.asgi_app()
     def web(self):
@@ -452,6 +525,18 @@ class Playground:
                 code_in = gr.Textbox(value=",".join(["1"] + ["0"] * (b - 1)), label=f"{b} subspace coordinates (comma-separated) — mapped through the block's basis")
                 go_code = gr.Button("Invert this code", variant="primary"); code_md = gr.Markdown()
                 code_tbl = gr.Dataframe(headers=["#", "cos raw", "cos centered", "block act", "block fires", "PC score σ", "peak tok", "rollout"], wrap=True); code_html = gr.HTML()
+            with gr.Tab("Text → PC score"):
+                pt_txt = gr.Textbox(lines=6, label="texts, one per line — scored on the selected block's PC (no inverter involved)")
+                with gr.Row():
+                    pt_pc = gr.Slider(1, b, value=1, step=1, label="PC"); go_pt = gr.Button("Score texts on this PC", variant="primary")
+                pt_md = gr.Markdown(); pt_tbl = gr.Dataframe(headers=["text", "block act", "rank@peak", "fires", "PC score @peak σ", "act-weighted mean PC σ", "peak tok"], wrap=True)
+            with gr.Tab("PC ↔ corpus"):
+                with gr.Row():
+                    ex_pc = gr.Slider(1, b, value=1, step=1, label="PC"); ex_n = gr.Slider(200, 3000, value=1000, step=100, label="sequences to scan (×512 tokens)")
+                    ex_show = gr.Slider(5, 30, value=12, step=1, label="contexts per tail"); go_ex = gr.Button("Show corpus text at the PC's tails", variant="primary")
+                ex_md = gr.Markdown()
+                with gr.Row():
+                    ex_neg = gr.HTML(); ex_pos = gr.HTML()
             with gr.Tab("Text → blocks"):
                 txt = gr.Textbox(lines=3, label="text (clean-base layer-42 activations)"); which = gr.Radio(["last kept token", "max over tokens"], value="last kept token", label="read at")
                 go_txt = gr.Button("Which blocks fire?", variant="primary"); txt_md = gr.Markdown()
@@ -476,6 +561,8 @@ class Playground:
             go_pc.click(lambda g, pc, sg, n, t, mx, cf, sd: self.ui_invert(g, "pc", pc, 1.0 if sg == "+" else -1.0, n, t, mx, cf, sd), [g_in, pc2_s, sign_s, n_s, temp_s, len_s, coeff_s, seed_s], [pc_md, pc_tbl, pc_html])
             go_code.click(_custom, [g_in, code_in, n_s, temp_s, len_s, coeff_s, seed_s], [code_md, code_tbl, code_html])
             go_txt.click(self.ui_text_blocks, [txt, which], [txt_md, txt_tbl])
+            go_pt.click(self.ui_text_pc, [pt_txt, g_in, pt_pc], [pt_md, pt_tbl])
+            go_ex.click(self.ui_pc_extremes, [g_in, ex_pc, ex_n, ex_show], [ex_md, ex_neg, ex_pos])
             demo.load(self.ui_block, [g_in], [card_md, card_html])
         demo.queue(max_size=16)
         api = FastAPI()
