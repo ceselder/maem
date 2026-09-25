@@ -3,8 +3,12 @@ recipe; eval/modal_build_ctx864_eval.py), (b) held-out features of the SAE the S
 layer-42 SAE: 512 features of its eval split, never in any training or RL bank; encoder and decoder directions, % whose target
 feature fires above the SAE's gate). Same checkpoint chain, FLOPs convention and style as plot_compute_vs_eval.py.
 
-    python scripts/plot_indist_vs_eval.py     # -> <report>/indist_vs_eval.{png,pdf} + data/indist_vs_eval.json
+    python scripts/plot_indist_vs_eval.py                 # (b) = % fired        -> <report>/indist_vs_eval.{png,pdf} + data json
+    python scripts/plot_indist_vs_eval.py --strength      # (b) = activation strength: mean over features of best-of-4 max-token
+                                                          #       target activation / that feature's corpus peak (1.0B-token scan)
+    add --zoom for panel (a) on 0.675-0.725 (base-model line then off-scale)       -> <report>/indist_vs_eval[_strength][_zoom].*
 """
+import argparse
 import glob
 import importlib.util
 import json
@@ -21,10 +25,24 @@ spec.loader.exec_module(cve)
 EVJ = os.path.expanduser("~/shared/overnight/eval_ckpt_json")
 TAGS = {"evals_sft": "sft_simple2m_sft_ctx864_c", "evals_rl": "rl_simple2m_8x2048_last16_lr5e-7_ctx864_c"}
 CTX = "eval/realact_ctx8_64/cos"
-SAE = [("eval/sae2m_dec/fired", "-", "decoder directions"), ("eval/sae2m_enc/fired", "--", "encoder directions")]
+STYLES = [("dec", "-", "decoder directions"), ("enc", "--", "encoder directions")]
+BASE_C = "#8c8c8c"                                   # untrained base model: gray dotted reference line (as in the paper figures)
+BASE_TAGS = {CTX: "base_qwen36_27b_ctx864_c", "sae2m": "base_qwen36_27b_c"}   # step 0 = Qwen3.6-27B, no MAEM training
+
+
+def base_value(key):
+    tag = BASE_TAGS[CTX] if key == CTX else BASE_TAGS["sae2m"]
+    f = f"{EVJ}/{tag}/ckpt_0.json"
+    return json.load(open(f))["metrics"].get(key) if os.path.exists(f) else None
 
 
 def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--strength", action="store_true")
+    ap.add_argument("--zoom", action="store_true", help="panel (a) zoomed to 0.675-0.725 (the base-model line is then off-scale, omitted)")
+    a = ap.parse_args()
+    metric, stem = ("norm_act", "indist_vs_eval_strength") if a.strength else ("fired", "indist_vs_eval")
+    stem += "_zoom" if a.zoom else ""
+    SAE = [(f"eval/sae2m_{d}/{metric}", ls, lab) for d, ls, lab in STYLES]
     raw = json.load(open(cve.RAW))
     for side, tag in TAGS.items():                      # merge the 8-64 family into the per-checkpoint eval dicts
         for f in glob.glob(f"{EVJ}/{tag}/ckpt_*.json"):
@@ -46,12 +64,26 @@ def main():
 
     line(ax_a, CTX, 1, "-", "MAEM (RL, from SFT final)", "MAEM (SFT)")
     ax_a.set_title("(a) real activations, 8–64-token context"); ax_a.set_ylabel("mean centred cosine")
-    ax_a.set_ylim(0.675, 0.725); ax_a.yaxis.set_major_locator(plt.MultipleLocator(0.01)); ax_a.yaxis.set_major_formatter("{x:.2f}")
-    ax_a.legend(loc="lower right", frameon=False)
+    b = base_value(CTX)
+    data["base_model"] = {CTX: b}
+    if a.zoom:
+        ax_a.set_ylim(0.675, 0.725); ax_a.yaxis.set_major_locator(plt.MultipleLocator(0.01)); ax_a.yaxis.set_major_formatter("{x:.2f}")
+    else:
+        if b is not None:
+            ax_a.axhline(b, color=BASE_C, ls=":", lw=1.8, label="base model (no training)", zorder=2)
+        ax_a.set_ylim(0.1, 0.8); ax_a.yaxis.set_major_locator(plt.MultipleLocator(0.1)); ax_a.yaxis.set_major_formatter("{x:.1f}")
+    ax_a.legend(loc="lower right" if a.zoom else "center right", frameon=False)
     for key, ls, _ in SAE:
         line(ax_b, key, 100, ls)
-    ax_b.set_title("(b) trained SAE, held-out features: fires"); ax_b.set_ylabel("% of SAE features fired")
-    ax_b.set_ylim(0, 45); ax_b.yaxis.set_major_locator(plt.MultipleLocator(10))
+        bv = base_value(key); data["base_model"][key] = bv
+        if bv is not None:
+            ax_b.axhline(100 * bv, color=BASE_C, ls=":", lw=1.8, zorder=2)
+    if a.strength:
+        ax_b.set_title("(b) trained SAE, held-out features: strength"); ax_b.set_ylabel("target activation (% of corpus peak)")
+        ax_b.set_ylim(0, 35); ax_b.yaxis.set_major_locator(plt.MultipleLocator(5))
+    else:
+        ax_b.set_title("(b) trained SAE, held-out features: fires"); ax_b.set_ylabel("% of SAE features fired")
+        ax_b.set_ylim(0, 45); ax_b.yaxis.set_major_locator(plt.MultipleLocator(10))
     ax_b.legend(handles=[Line2D([], [], color="#444444", lw=1.8, ls=ls, label=lab) for _, ls, lab in SAE], loc="upper left", frameon=False)
     xs = [x for x, _ in sft_pts + rl_pts]; lo, hi = min(xs) / 1.3, max(xs) * 1.3
     ts = [t for t in cve.doubling_ticks(min(xs), hi) if t >= lo]
@@ -61,9 +93,10 @@ def main():
     fig.tight_layout(w_pad=2.0)
     os.makedirs(f"{cve.OUT}/data", exist_ok=True)
     for ext in ("png", "pdf"):
-        fig.savefig(f"{cve.OUT}/indist_vs_eval.{ext}", dpi=150)
-    json.dump(data, open(f"{cve.OUT}/data/indist_vs_eval.json", "w"), indent=1)
-    print("wrote", f"{cve.OUT}/indist_vs_eval.png + .pdf + data/indist_vs_eval.json")
+        fig.savefig(f"{cve.OUT}/{stem}.{ext}", dpi=150)
+    data["sae_metric"] = metric
+    json.dump(data, open(f"{cve.OUT}/data/{stem}.json", "w"), indent=1)
+    print("wrote", f"{cve.OUT}/{stem}.png + .pdf + data/{stem}.json")
 
 
 if __name__ == "__main__":
