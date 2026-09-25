@@ -80,6 +80,7 @@ SFT_DISK_GB = int(os.environ.get("SFT_DISK_GB", "600"))
 image = (
     image
     .env({"SFT_DISK_GB": str(SFT_DISK_GB)})
+    .add_local_file(REPO / "sft" / "loss.py", "/pmx/SL/loss.py")
     .add_local_file(REPO / "sft" / "pretrain.py", "/pmx/SL/pretrain.py")
     .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/SL/prefix_cache.py")   # --prefix-cache sibling import
     .add_local_file(REPO / "sft" / "fullft.py", "/pmx/SL/fullft.py")               # --full-ft (FSDP2) sibling import

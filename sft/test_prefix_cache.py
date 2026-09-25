@@ -53,6 +53,7 @@ image = (
                "PYTHONPATH": "/pmx/helpers:/pmx"})
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
     .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/sft/prefix_cache.py")
+    .add_local_file(REPO / "sft" / "loss.py", "/pmx/sft/loss.py")
     .add_local_file(REPO / "sft" / "pretrain.py", "/pmx/sft/pretrain.py")
 )
 
@@ -504,9 +505,11 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
                 cleanup()
         results["rows"].append(row)
 
-    def make_step_accum(B, n_accum, share):
+    def make_step_accum(B, n_accum, share, pad_multiple=8, head=False, fused_ce=False):
         """Match pretrain.py --grad-accum: mean of micro-batch token-mean losses."""
-        pc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device)
+        undo_head = pcmod.install_prefix_label_head(model, fused_ce=fused_ce) if head else None
+        pc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device,
+                               pad_multiple=pad_multiple)
         ac = lambda: autocast_region(model, autocast_on)
 
         def step(force_len=None):
@@ -529,7 +532,30 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
             opt.zero_grad(set_to_none=True)
             return B * n_accum, n_tok, L
 
-        return step
+        return step, undo_head
+
+    if "fused" in configs:
+        # Check the actual 248k-vocabulary CUDA loss and its backward before timing.
+        from sft.loss import cross_entropy_sum
+        parity = []
+        cg = torch.Generator(device=device).manual_seed(seed)
+        for scale in (1.0, 8.0):
+            logits = (torch.randn(127, tok.vocab_size, generator=cg, device=device,
+                                  dtype=torch.bfloat16) * scale).requires_grad_()
+            labels = torch.randint(tok.vocab_size, (127,), generator=cg, device=device)
+            labels[::11] = -100
+            losses, grads = [], []
+            for fused in (False, True):
+                loss = cross_entropy_sum(logits, labels, fused=fused) / 115
+                grads.append(torch.autograd.grad(loss, logits)[0])
+                losses.append(loss.detach())
+            torch.testing.assert_close(losses[0], losses[1], atol=2e-5, rtol=2e-6)
+            torch.testing.assert_close(grads[0], grads[1], atol=1e-6, rtol=0.01)
+            parity.append({"scale": scale, "loss_abs_diff": (losses[0] - losses[1]).abs().item(),
+                           "grad_max_abs_diff": (grads[0] - grads[1]).abs().max().item()})
+            del logits, losses, grads, loss
+        results["fused_ce_parity"] = parity
+        print("[fused-ce parity] " + json.dumps(parity), flush=True)
 
     for spec in configs.split(","):
         kind, Bs = spec.split(":")
@@ -553,8 +579,13 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
             fn, cl = make_cached(B, False, n_acc, compile_mlp=True); run_case(label, B * n_acc, fn, cl)
         elif kind == "cached_pad16":
             fn, cl = make_cached(B, False, n_acc, pad_multiple=16); run_case(label, B * n_acc, fn, cl)
-        elif kind in ("cached_gradaccum", "cached_sharedstep"):
-            run_case(label, B * n_acc, make_step_accum(B, n_acc, kind == "cached_sharedstep"))
+        elif kind == "cached_gradaccum" or kind in (
+                "cached_sharedstep", "cached_sharedstep_pad1", "cached_sharedstep_head",
+                "cached_sharedstep_fused", "cached_sharedstep_fused_pad1"):
+            fn, cl = make_step_accum(B, n_acc, kind != "cached_gradaccum",
+                                    pad_multiple=1 if kind.endswith("pad1") else 8,
+                                    head="head" in kind or "fused" in kind, fused_ce="fused" in kind)
+            run_case(label, B * n_acc, fn, cl)
         else:
             raise ValueError(spec)
     if compile_:

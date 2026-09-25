@@ -35,6 +35,11 @@ import torch
 
 from mxf.inject import hooked, make_inject_hook
 
+try:
+    from sft.loss import cross_entropy_sum
+except ImportError:  # Modal sibling mount.
+    from loss import cross_entropy_sum
+
 
 def unwrap_base(model):
     """HF base model through DDP + PEFT wrappers."""
@@ -324,14 +329,13 @@ class SuffixCheckpointer:
         return forward
 
 
-def install_prefix_label_head(model, ce_chunk=0):
+def install_prefix_label_head(model, ce_chunk=0, fused_ce=False):
     """Replace the CausalLM forward (when ``labels`` are given) by: transformer body -> lm_head + fp32 cross-entropy
     ONLY at the label positions, optionally in recomputed chunks of ``ce_chunk`` rows (peak = one chunk of fp32 logits
     instead of [B, L, 248k] bf16 + fp32 + softmax). Mean over label tokens == HF ForCausalLM's loss (same math as
     pretrain.py's LabelHeadLM, which the --parity-check asserted to < 1e-3). Calls without labels (the prefix forward,
     logits_to_keep=1) go through the original forward. Installed on the module instance so FSDP2's root hooks (module
     pre/post forward hooks) still wrap it. Returns an undo callable."""
-    import torch.nn.functional as F
     from torch.utils.checkpoint import checkpoint
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -340,7 +344,7 @@ def install_prefix_label_head(model, ce_chunk=0):
     lm_head = base.lm_head
 
     def head_ce_sum(h_rows, tgt_rows):
-        return F.cross_entropy(lm_head(h_rows).float(), tgt_rows, reduction="sum")
+        return cross_entropy_sum(lm_head(h_rows), tgt_rows, fused=fused_ce)
 
     def forward(input_ids=None, attention_mask=None, position_ids=None, past_key_values=None, inputs_embeds=None,
                 labels=None, use_cache=None, logits_to_keep=0, **kwargs):

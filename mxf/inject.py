@@ -30,7 +30,7 @@ def make_inject_hook(vecs, positions, coeff, device, dtype, mode="add"):
         raise ValueError("each vector row must have one vector per marker position")
     normed = torch.nn.functional.normalize(torch.cat(vecs).to(device, dtype), dim=-1)
     rows = torch.repeat_interleave(torch.arange(len(vecs), device=device),
-                                  torch.tensor(counts, device=device))
+                                  torch.tensor(counts, device=device), output_size=sum(counts))
     cols = torch.tensor([p for row in positions for p in row], device=device)
 
     def hook(_module, _inp, out):

@@ -45,6 +45,11 @@ from mxf.inject import FixedPositionInjector, get_layer, hooked, make_inject_hoo
 from mxf.mfu import mfu
 from mxf.prompts import build_prompt_ids, build_sft_ids
 
+try:
+    from sft.loss import cross_entropy_sum
+except ImportError:  # Modal mounts this file and loss.py as siblings.
+    from loss import cross_entropy_sum
+
 
 @contextlib.contextmanager
 def autocast_region(model, enabled):
@@ -306,14 +311,14 @@ class LabelHeadLM(torch.nn.Module):
     model so DDP / no_sync / save_pretrained keep working on the same parameters; the frozen lm_head is
     applied under whatever autocast is active (bf16 matmul), then CE in fp32 -- as HF does."""
 
-    def __init__(self, peft_model, ce_chunk=0):
+    def __init__(self, peft_model, ce_chunk=0, fused_ce=False):
         super().__init__()
         self.peft_model = peft_model
         self.ce_chunk = ce_chunk
+        self.fused_ce = fused_ce
 
-    @staticmethod
-    def _head_ce_sum(lm_head, h_rows, tgt_rows):
-        return F.cross_entropy(lm_head(h_rows).float(), tgt_rows, reduction="sum")
+    def _head_ce_sum(self, lm_head, h_rows, tgt_rows):
+        return cross_entropy_sum(lm_head(h_rows), tgt_rows, fused=self.fused_ce)
 
     def hidden(self, input_ids, attention_mask, **body_kw):
         """Final-norm hidden states [B, L, d] from the transformer body (compiled if --compile)."""
@@ -517,6 +522,9 @@ def main():
                          "~85%% of them masked). Identical loss; with --compile only the transformer body is compiled.")
     ap.add_argument("--ce-chunk", type=int, default=0,
                     help="--head-on-labels: rows of fp32 logits per recomputed chunk (0 = one chunk; ~1 MB/row)")
+    ap.add_argument("--fused-ce", action="store_true",
+                    help="with either label-head flag: compile fp32 cross-entropy to avoid full-size fp32 "
+                         "logits/softmax intermediates. Same objective; reduction rounding may differ.")
     ap.add_argument("--parity-check", action="store_true",
                     help="on the first batch, assert |HF loss - head-on-labels loss| < 1e-3 and print both")
     ap.add_argument("--prefix-cache", action="store_true",
@@ -597,6 +605,8 @@ def main():
     assert not a.suffix_ckpt or a.prefix_cache, "--suffix-ckpt is a --prefix-cache knob"
     assert not a.prefix_head_on_labels or a.prefix_cache, "--prefix-head-on-labels is a --prefix-cache knob"
     assert a.pad_multiple >= 1, "--pad-multiple must be >= 1"
+    assert not a.fused_ce or a.head_on_labels or a.prefix_head_on_labels, \
+        "--fused-ce requires --head-on-labels or --prefix-head-on-labels"
     assert not (a.length_bucket and a.pack_len), "--length-bucket is for the per-example path (no --pack-len)"
 
     world = int(os.environ.get("WORLD_SIZE", 1)); rank = int(os.environ.get("RANK", 0))
@@ -704,7 +714,7 @@ def main():
         persistent_handle = submodule.register_forward_hook(persistent_injector.hook)
     # --head-on-labels: the gather has a data-dependent size, so only the transformer body is compiled
     # (one static graph per padded length); gather + lm_head + CE run eagerly on a few hundred rows.
-    label_head = LabelHeadLM(model, a.ce_chunk)
+    label_head = LabelHeadLM(model, a.ce_chunk, fused_ce=a.fused_ce)
     compiled = []   # (module, eager forward) pairs, so --parity-check can run the eager reference
     if a.compile:
         target = model.get_base_model().model if a.head_on_labels else model
@@ -751,7 +761,7 @@ def main():
             if is_main:
                 print("[pretrain] compile-blocks: every decoder layer's MLP is torch.compiled (dynamic=True)", flush=True)
         if a.prefix_head_on_labels:
-            install_prefix_label_head(model, a.ce_chunk)
+            install_prefix_label_head(model, a.ce_chunk, fused_ce=a.fused_ce)
         if a.prefix_share_step:
             # Sharing stochastic prefix computations changes the objective. This trainer creates
             # zero-dropout LoRAs, but reject a resumed adapter/base with active dropout as well.
@@ -908,7 +918,7 @@ def main():
                         mb = len(batch) // a.prefix_accum
                         n_tot = sum(len(t) for t in targets)
                         cache0 = prefix_cache.run_prefix(ac)
-                        loss_val, n_real = 0.0, prefix_cache.prefix_len
+                        loss_val, n_real = torch.zeros((), device=device), prefix_cache.prefix_len
                         for k in range(a.prefix_accum):
                             last = k == a.prefix_accum - 1
                             sl = slice(k * mb, len(batch) if last else (k + 1) * mb)
@@ -917,13 +927,13 @@ def main():
                             with ctx:
                                 o = prefix_cache.forward(vmat[sl], targets[sl], autocast=ac, prefix_cache=cache0)
                                 (o.loss * (o.n_target_tokens / n_tot) / len(group)).backward(retain_graph=not last)
-                            loss_val += o.loss.item() * o.n_target_tokens / n_tot
+                            loss_val += o.loss.detach() * (o.n_target_tokens / n_tot)
                             n_suf = int(o.suffix_mask.sum())
                             n_real += n_suf
                             n_pad_real += n_suf; n_pad_slots += o.suffix_len * o.suffix_mask.shape[0]
                             del o
                         del cache0
-                        loss = torch.tensor(loss_val, device=device)
+                        loss = loss_val
                     n_ex_step += len(batch)
                     n_real_step += n_real
                     loss_step += loss.detach() / len(group)

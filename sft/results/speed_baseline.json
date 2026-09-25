@@ -1,0 +1,53 @@
+{
+  "env": {
+    "gpu": "NVIDIA B200",
+    "torch": "2.10.0+cu128",
+    "transformers": "5.15.0",
+    "transformers_fork": true,
+    "peft": "0.20.0",
+    "fla": "0.5.2",
+    "triton": "3.6.0",
+    "tf_spec": "transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
+  },
+  "prompt_len": 103,
+  "marker": 102,
+  "steps": 5,
+  "warmup": 3,
+  "autocast_bf16": true,
+  "target_len_range": [
+    8,
+    32
+  ],
+  "rows": [
+    {
+      "config": "cached_gradaccum 64x4",
+      "micro_batch": 256,
+      "first_step_s": 179.68620347976685,
+      "shape_warmup_s": 8.001055240631104,
+      "examples_per_s": 61.8895931512302,
+      "target_tokens_per_s": 1316.1208793566298,
+      "ms_per_step": 4136.39817237854,
+      "peak_mem_gb": 144.2834005355835,
+      "mean_seq_len": 40.0,
+      "ms_per_step_synced": 4147.830104827881,
+      "ms_step_min": 4051.7797470092773,
+      "ms_step_median": 4119.569778442383,
+      "ms_step_max": 4297.139883041382
+    },
+    {
+      "config": "cached_sharedstep 64x4",
+      "micro_batch": 256,
+      "first_step_s": 2.8647162914276123,
+      "shape_warmup_s": 4.96418571472168,
+      "examples_per_s": 87.89097222570105,
+      "target_tokens_per_s": 1869.056456237174,
+      "ms_per_step": 2912.699604034424,
+      "peak_mem_gb": 144.5848150253296,
+      "mean_seq_len": 40.0,
+      "ms_per_step_synced": 2887.2350215911865,
+      "ms_step_min": 2878.462553024292,
+      "ms_step_median": 2884.1540813446045,
+      "ms_step_max": 2897.808074951172
+    }
+  ]
+}
