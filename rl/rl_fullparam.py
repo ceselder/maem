@@ -42,7 +42,10 @@ import time
 import torch
 import torch.distributed as dist
 
-_LM_PREFIX = "model.language_model."
+try:                                   # model profile: Qwen3.6 multimodal key layout vs plain CausalLM ("model.")
+    from mxf.config import LM_PREFIX as _LM_PREFIX
+except ImportError:  # pragma: no cover
+    _LM_PREFIX = "model.language_model."
 
 
 def fullft_module():

@@ -1,9 +1,35 @@
 """Central config. Scales from K=10k (pilot) to K=1,000,000 clusters by changing CLUSTERS."""
+import os
 from dataclasses import dataclass, field
 
-MODEL = "Qwen/Qwen3.6-27B"
-D_MODEL = 5120
-READ_LAYER = 42        # 27B: layer the direction is read/maximized at (matches the SAE)
+# Model profile: env MAEMM_MODEL_PROFILE, else the one-word file mxf/PROFILE (ships inside every Modal image that mounts mxf/),
+# else qwen36-27b. Everything model-specific the pipeline branches on lives here.
+_PROFILES = {
+    "qwen36-27b": dict(MODEL="Qwen/Qwen3.6-27B", D_MODEL=5120, READ_LAYER=42, N_LAYERS=64, MULTIMODAL=True,
+                       WHITEN_MU="/data/acts27b/whiten_mu.npy"),
+    # Qwen3-8B + Adam Karvonen's BatchTopK SAE (adamkarvonen/qwen3-8b-saes, resid_post_layer_27 trainer_2: 65,536 features, k=80)
+    "qwen3-8b": dict(MODEL="Qwen/Qwen3-8B", D_MODEL=4096, READ_LAYER=27, N_LAYERS=36, MULTIMODAL=False,
+                     WHITEN_MU="/data/qwen3_8b/whiten_mu_l27.npy"),
+}
+
+
+def _profile_name():
+    p = os.environ.get("MAEMM_MODEL_PROFILE", "").strip()
+    f = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PROFILE")
+    if not p and os.path.exists(f):
+        p = open(f).read().strip()
+    return p or "qwen36-27b"
+
+
+PROFILE = _profile_name()
+_P = _PROFILES[PROFILE]
+MODEL = _P["MODEL"]
+D_MODEL = _P["D_MODEL"]
+READ_LAYER = _P["READ_LAYER"]  # layer the direction is read/maximized at (matches the SAE)
+N_LAYERS = _P["N_LAYERS"]
+MULTIMODAL = _P["MULTIMODAL"]  # Qwen3.6 = Qwen3_5ForConditionalGeneration (text weights under model.language_model.*, vision shard)
+LM_PREFIX = "model.language_model." if MULTIMODAL else "model."   # checkpoint key prefix of the decoder stack
+WHITEN_MU = _P["WHITEN_MU"]    # layer-READ_LAYER corpus mean: realact direction centering + the centered scorer
 INJECT_LAYER = 1       # activation-oracle injection site
 STEER_COEFF = 1.0      # norm-matched addition scale
 EMBED_MODEL = "BAAI/bge-large-en-v1.5"   # fast clusterer; swap to bge-small for max speed

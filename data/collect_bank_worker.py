@@ -87,7 +87,7 @@ def main():
 
     t0 = time.time()
     tok = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
-    bos = tok.bos_token_id if tok.bos_token_id is not None else 248044
+    bos = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa",
                                                  local_files_only=True, device_map={"": "cuda:0"}).eval()
     assert model.config.hidden_size == D_MODEL

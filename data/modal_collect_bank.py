@@ -50,7 +50,18 @@ GPU = os.environ.get("COLLECT_GPU", "H200:8")
 SMOKE_GPU = os.environ.get("COLLECT_SMOKE_GPU", "H200:1")
 DATASET = "m-a-p/FineFineWeb"
 FALLBACK = ("HuggingFaceFW/fineweb", "sample-10BT")
-MU_PATH = "/data/acts27b/whiten_mu.npy"
+def _mxf_config():
+    """mxf/config.py loaded standalone (container: the mounted /pmx/helpers/mxf; deploy host: the repo) -> the model profile."""
+    import importlib.util
+    for p in ("/pmx/helpers/mxf/config.py", str(REPO / "mxf" / "config.py")):
+        if os.path.exists(p):
+            spec = importlib.util.spec_from_file_location("mxf_config_standalone", p)
+            m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+            return m
+    raise FileNotFoundError("mxf/config.py")
+
+
+MU_PATH = _mxf_config().WHITEN_MU          # 27B: /data/acts27b/whiten_mu.npy; qwen3-8b: /data/qwen3_8b/whiten_mu_l27.npy
 EXCLUDE_STORES = ["/data/acts27b", "/data/acts27b_long", "/data/acts_longctx"]   # any that exist: hash their rows
 
 

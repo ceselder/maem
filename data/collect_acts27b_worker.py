@@ -229,7 +229,7 @@ def main():
     t0 = time.time()
     log(r, f"loading {MODEL} (read layer {READ_LAYER}, d={D_MODEL})")
     tok = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
-    bos = tok.bos_token_id if tok.bos_token_id is not None else 248044  # suite convention
+    bos = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id  # suite convention
     model = AutoModelForCausalLM.from_pretrained(
         MODEL, dtype=torch.bfloat16, attn_implementation="sdpa",
         local_files_only=True, device_map={"": "cuda:0"}).eval()

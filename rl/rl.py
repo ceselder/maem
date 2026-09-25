@@ -50,7 +50,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import wandb
-from mxf.config import D_MODEL, INJECT_LAYER, MODEL, READ_LAYER, STEER_COEFF, RLConfig, TrainConfig
+from mxf.config import D_MODEL, INJECT_LAYER, MODEL, MULTIMODAL, READ_LAYER, STEER_COEFF, RLConfig, TrainConfig
 from mxf.inject import get_layer, hooked, make_inject_hook, read_resid
 from mxf.prompts import build_prompt_ids
 
@@ -159,7 +159,7 @@ def init_vllm(a, local, rank, p_len, max_seqs):
         from vllm import LLM
         llm = LLM(model=MODEL, tensor_parallel_size=1, gpu_memory_utilization=a.vllm_gpu_mem,
                   max_model_len=p_len + a.max_new_tokens + 8, attention_backend="TRITON_ATTN",
-                  enforce_eager=True, language_model_only=True, enable_prefix_caching=False,
+                  enforce_eager=True, enable_prefix_caching=False, **({'language_model_only': True} if MULTIMODAL else {}),
                   enable_lora=True, max_loras=1, max_lora_rank=64, max_num_seqs=max(int(max_seqs), 1),
                   seed=a.seed * 1000 + rank, dtype="bfloat16")
     finally:

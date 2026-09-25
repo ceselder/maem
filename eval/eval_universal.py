@@ -63,7 +63,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
-from mxf.config import MODEL, D_MODEL, INJECT_LAYER, READ_LAYER, STEER_COEFF
+from mxf.config import MODEL, D_MODEL, INJECT_LAYER, READ_LAYER, STEER_COEFF, WHITEN_MU
 from mxf.inject import get_layer, make_inject_hook, hooked, read_resid
 from mxf.prompts import build_prompt_ids
 from mxf.sae import load_sae, load_max_acts
@@ -239,7 +239,7 @@ def _reencode(gen_texts, actor, tok, device, sbatch=32):
 # (full-document tails) instead of 1, and every reported mean_all / RL reward was compressed by that token-dependent
 # factor. MAEMM_SCORER_CENTER=0 reproduces the legacy raw metric (only for re-deriving old numbers).
 # ---------------------------------------------------------------------------------------------
-CENTER_MU_PATH = os.environ.get("MAEMM_WHITEN_MU", "/data/acts27b/whiten_mu.npy")
+CENTER_MU_PATH = os.environ.get("MAEMM_WHITEN_MU", WHITEN_MU)   # model profile default (27B: /data/acts27b/whiten_mu.npy)
 _CENTER_MU = {}
 
 

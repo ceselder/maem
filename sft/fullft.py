@@ -23,7 +23,10 @@ import time
 import torch
 import torch.distributed as dist
 
-_LM_PREFIX = "model.language_model."
+try:                                   # model profile (mxf/config.py): Qwen3.6 = "model.language_model.", plain CausalLM = "model."
+    from mxf.config import LM_PREFIX as _LM_PREFIX
+except ImportError:  # pragma: no cover
+    _LM_PREFIX = "model.language_model."
 
 
 class FSDPNoSync:
@@ -224,7 +227,9 @@ def kernel_backends(model):
     import sys
     base = model.module if hasattr(model, "module") else model
     base = base.get_base_model() if hasattr(base, "get_base_model") else base
-    layer = next(l for l in base.model.layers if hasattr(l, "linear_attn"))
+    layer = next((l for l in base.model.layers if hasattr(l, "linear_attn")), None)
+    if layer is None:                  # no gated-delta-net layers (plain-attention model, e.g. Qwen3-8B)
+        return {"gdn": "none (plain attention)"}
     mod = sys.modules[type(layer.linear_attn).__module__]
     out = {}
     for name, pkg in (("torch_chunk_gated_delta_rule", "fla"), ("causal_conv1d_fn", "causal_conv1d")):

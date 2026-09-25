@@ -30,6 +30,7 @@ import json
 import os
 
 import modal
+from pathlib import Path
 
 APP_NAME = os.environ.get("MAEMM_MIX5M_APP", "maemm-mix-5m-bank")
 app = modal.App(APP_NAME)
@@ -39,11 +40,26 @@ image = (
     .pip_install("torch==2.10.0", index_url="https://download.pytorch.org/whl/cu128")
     .pip_install("numpy==2.4.6", "transformers==5.15.0", "huggingface_hub==1.27.0", "tokenizers==0.22.2", "safetensors==0.8.0", "hf_xet")
     .env({"HF_HOME": "/data/hf_cache"})       # tokenizer loads OFFLINE from the volume's HF cache (same pins/cache as the rest of the suite)
+    .add_local_dir(Path(__file__).resolve().parent.parent / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])   # model profile only
 )
-MODEL = "Qwen/Qwen3.6-27B"                    # == mxf.config.MODEL (this image does not mount /pmx/helpers; the cache load asserts the id)
+
+
+def _mxf_config():
+    """mxf/config.py loaded standalone (container: /pmx/helpers/mxf; deploy host: the repo) -> the model profile."""
+    import importlib.util
+    for p in ("/pmx/helpers/mxf/config.py", str(Path(__file__).resolve().parent.parent / "mxf" / "config.py")):
+        if os.path.exists(p):
+            spec = importlib.util.spec_from_file_location("mxf_config_standalone", p)
+            m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+            return m
+    raise FileNotFoundError("mxf/config.py")
+
+
+_CFG = _mxf_config()
+MODEL = _CFG.MODEL                            # model profile (27B: Qwen/Qwen3.6-27B)
 TRIM_MIN_TOK = 8                              # trim_to_peak: a trimmed target must keep at least this many tokens
 SMALL_GPUS = ["H100", "A100-80GB", "L40S", "A100-40GB"]   # leak check only (a few GB); the rest is I/O
-D = 5120
+D = _CFG.D_MODEL                              # 27B: 5120; qwen3-8b: 4096
 EVAL_CACHE_V2 = "/data/eval_universal_ho/eval_sets_heldout_v2.pt"
 POOL_HELDOUT = "/data/pool_heldout"
 LEAK_COS = 0.999
@@ -325,9 +341,11 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
     es = torch.load(eval_cache, map_location="cpu", weights_only=False)   # every `*_dirs` family (v3 adds the held-out 2M-SAE enc/dec dirs)
     ref_names = sorted(k[:-5] for k in es if k.endswith("_dirs") and torch.is_tensor(es[k]))
     refs = [F.normalize(es[f"{n}_dirs"].float().reshape(-1, D), dim=-1) for n in ref_names]
-    ho_n = os.path.getsize(f"{POOL_HELDOUT}/vecs.f32") // (4 * D)
-    ho = np.memmap(f"{POOL_HELDOUT}/vecs.f32", np.float32, "r", shape=(ho_n, D))
-    ho_fam = np.array([json.loads(l)["family"] for l in open(f"{POOL_HELDOUT}/records.jsonl")])
+    use_ho = _CFG.PROFILE == "qwen36-27b"                   # /data/pool_heldout is the 27B universal-bank pool (5120-d)
+    ho_fam = np.array([json.loads(l)["family"] for l in open(f"{POOL_HELDOUT}/records.jsonl")]) if use_ho else np.array([], str)
+    if use_ho:
+        ho_n = os.path.getsize(f"{POOL_HELDOUT}/vecs.f32") // (4 * D)
+        ho = np.memmap(f"{POOL_HELDOUT}/vecs.f32", np.float32, "r", shape=(ho_n, D))
     for hf in sorted(set(ho_fam.tolist())):
         refs.append(F.normalize(torch.from_numpy(np.asarray(ho[np.flatnonzero(ho_fam == hf)])).float(), dim=-1)); ref_names.append(f"pool_heldout/{hf}")
     ref = torch.cat(refs).to(dev)
@@ -431,7 +449,7 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
                                        f"argmax of the direction's per-token cosine, sink dropped; exact by causality); rows dropped at selection when "
                                        f"len(ids) != n_tok, decode->re-encode != cut, or cut < {trim_min_tok} tokens; records carry n_tok=peak_idx+1 and "
                                        f"trimmed_from_n_tok; tokenizer {MODEL}" if trim_fams else None),
-             "source_meta": src_meta, "d_model": D, "model": "Qwen/Qwen3.6-27B", "layer": 42, "created": time.time(), "wall_s": time.time() - T0}
+             "source_meta": src_meta, "d_model": D, "model": MODEL, "layer": _CFG.READ_LAYER, "created": time.time(), "wall_s": time.time() - T0}
     json.dump(stats, open(f"{out}/build_stats.json", "w"), indent=1)
     json.dump({**stats, "trainer_args": {"--data-dir": out, "--bank-file": "vecs.f32"}}, open(f"{out}/meta.json", "w"), indent=1)
     vol.commit()

@@ -83,6 +83,11 @@ if TRAINER_TRITON:
     # into the image env so _env() (which runs in the container) sees it (same bug class as the old N_GPU re-read).
     image = (image.run_commands(f"pip install --no-deps --target /opt/triton_{TRAINER_TRITON} triton=={TRAINER_TRITON}")
                   .env({"DISAGG_TRAINER_TRITON": TRAINER_TRITON}))
+# Reward scorer centering, baked at deploy time: DISAGG_SCORER_CENTER=0 -> MAEMM_SCORER_CENTER=0 in the container = the LEGACY raw-h
+# cosine reward the 2026-09-17 paper RL run trained with (the centered fix came 09-18). Unset = the code default (centered).
+SCORER_CENTER = os.environ.get("DISAGG_SCORER_CENTER", "")
+if SCORER_CENTER:
+    image = image.env({"MAEMM_SCORER_CENTER": SCORER_CENTER})
 image = (
     image
     .add_local_file(REPO / "rl" / "rl.py", "/pmx/RL/rl_hf.py")

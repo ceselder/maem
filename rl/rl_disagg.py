@@ -1321,6 +1321,12 @@ class _FullParamSync:
 # ==============================================================================================
 # ROLLOUT rank
 # ==============================================================================================
+def _multimodal():
+    """mxf.config.MULTIMODAL (model profile): True for Qwen3.6-27B (Qwen3_5ForConditionalGeneration), False for plain CausalLMs."""
+    from mxf.config import MULTIMODAL
+    return bool(MULTIMODAL)
+
+
 def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
     """vLLM engine on this rank's (only visible) GPU. vllm_lens' plugin is loaded first so its
     LLM.generate/steering patches are live; its EngineArgs patch (which FORCES enforce_eager and
@@ -1352,7 +1358,8 @@ def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
         engine_model = getattr(a, "engine_model", None) or getattr(a, "policy_base", None) or MODEL
         engine_lora = bool(getattr(a, "engine_lora", True))
         kw = dict(model=engine_model, tensor_parallel_size=1, gpu_memory_utilization=a.vllm_gpu_mem, max_model_len=max_len,
-                  attention_backend="TRITON_ATTN", language_model_only=True, enable_prefix_caching=False,
+                  attention_backend="TRITON_ATTN", enable_prefix_caching=False,
+                  **({"language_model_only": True} if _multimodal() else {}),   # Qwen3.6 = multimodal wrapper; Qwen3-8B = plain LM
                   enable_lora=engine_lora, max_num_seqs=int(max_seqs),
                   **({"max_loras": 2, "max_lora_rank": 64} if engine_lora else {}),
                   # never chunk a prompt (the marker must be prefilled in a hooked, eager pass): budget = every seq's full prompt+gen
@@ -2510,7 +2517,7 @@ def run_trainer(a):
         opt = torch.optim.AdamW(list(actor.parameters()), lr=a.lr, weight_decay=a.weight_decay, eps=a.adam_eps, betas=tuple(a.adam_betas))
         if a.load_optim:
             FP.load_optim_dcp(actor, opt, a.load_optim, log=lambda m: _log(tag, m))
-        if is_main:
+        if is_main and _multimodal():             # vision/MTP tensors exist only in the Qwen3.6 base repo
             fp.nontext_shard = "/tmp/base_nontext.safetensors"
             FT.prepare_nontext_shard(MODEL, fp.nontext_shard, log=lambda m: _log(tag, m))
         submodule = get_layer(actor, INJECT_LAYER)

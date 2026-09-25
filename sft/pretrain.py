@@ -40,7 +40,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import wandb
-from mxf.config import D_MODEL, INJECT_LAYER, MODEL, STEER_COEFF, TrainConfig
+from mxf.config import D_MODEL, INJECT_LAYER, MODEL, MULTIMODAL, STEER_COEFF, TrainConfig
 from mxf.inject import FixedPositionInjector, get_layer, hooked, make_inject_hook, make_packed_inject_hook
 from mxf.mfu import mfu
 from mxf.prompts import build_prompt_ids, build_sft_ids
@@ -651,8 +651,8 @@ def main():
         if is_main:
             print(f"[fullft] kernel backends: {FT.kernel_backends(model)} | optim {a.optim} | suffix_ckpt {a.suffix_ckpt} | "
                   f"prefix_head_on_labels {a.prefix_head_on_labels} ce_chunk {a.ce_chunk} | prefix_share_step {a.prefix_share_step}", flush=True)
-        nontext_shard = "/tmp/base_nontext.safetensors"
-        if is_main:
+        nontext_shard = "/tmp/base_nontext.safetensors" if MULTIMODAL else None   # vision/MTP tensors only exist for Qwen3.6
+        if is_main and nontext_shard:
             FT.prepare_nontext_shard(MODEL, nontext_shard)
     else:
         base_src = a.policy_base or MODEL
