@@ -14,7 +14,7 @@ import modal
 os.environ.setdefault("MODAL_PROFILE", "safety-sahan")
 APP = os.environ.get("RESCORE_APP", "maemm-eval-ckpt-s2m-c")
 CACHE = "/data/eval_universal_ho/eval_sets_ctx864.pt"
-EXTRA = f"--full-model --no-wandb --eval-cache {CACHE} --no-extra-evals"
+EXTRA = f"--full-model --no-wandb --dump-per-dir --eval-cache {CACHE} --no-extra-evals"   # per-dir -> exact SE + paired diffs
 IDS = os.path.expanduser("~/shared/overnight/simple2m/ids.json")
 RUNS = [("/data/sft_mix/simple2m_sft", "sft_simple2m_sft_ctx864_c", 1954, [244, 488, 732, 976, 1220, 1464, 1708, 1952, 1954]),
         ("/data/ckpts_rl_simple2m_8x2048_last16_lr5e-7", "rl_simple2m_8x2048_last16_lr5e-7_ctx864_c", 300, [25, 50, 100, 150, 200, 250, 300])]
