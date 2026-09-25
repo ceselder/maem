@@ -29,7 +29,8 @@ IDS, LOG = f"{D_DIR}/ids.json", f"{D_DIR}/driver.log"
 VOL = modal.Volume.from_name("maemm-data")
 UFW = lambda skip: json.dumps({"dataset": "openbmb/Ultra-FineWeb", "config": None, "split": "en", "shuffle": False, "skip": skip})
 CACHE = "/data/eval_universal_ho/eval_sets_8b.pt"
-EVAL_EXTRA = f"--eval-cache {CACHE} --no-extra-evals --eval-sae /data/qwen3_8b/sae/ae.pt"
+SAE16K_PEAKS_CALL = "fc-01M3D8WDE98CNY0PDYHVFYB068"   # maemm-8b-prep.sae16k_peaks (unseen-SAE corpus peaks)
+EVAL_EXTRA = f"--eval-cache {CACHE} --no-extra-evals --eval-sae /data/qwen3_8b/sae16k/ae.pt"   # always-scored "sae" family = UNSEEN 16k SAE
 SFT_RUN, SFT_MIX, RL_POOL = "qwen3_8b_sft", "mix8b_sft", "mix8b_rl"
 RL_RUN = "qwen3_8b_rl_last16_lr5e-7"
 EFF_BATCH, RL_STEPS = 4096, 300
@@ -38,7 +39,7 @@ RL_EXTRA = ("--recipe scalerl --loss cispo --cispo-eps-max 5 --loss-agg prompt -
             "--max-lag 2 --fp32-head --autocast-bf16 --length-control penalty --kl-coef 0 --entropy-coef 0 --entropy-target 0 --groups-per-step 2048 "
             "--group-size 8 --warmup-steps 25 --len-penalty-start 8 --len-penalty-per-tok 0.00025 --max-new-tokens 192 "
             "--score-length-bucket --cuda-graphs --max-num-seqs 512 --rollout-block-groups 32 --save-every 0 --transcript-every 5 "
-            f"--save-steps 25,50,100,150,200,250,300 --eval-cache {CACHE} --eval-sae /data/qwen3_8b/sae/ae.pt "
+            f"--save-steps 25,50,100,150,200,250,300 --eval-cache {CACHE} --eval-sae /data/qwen3_8b/sae16k/ae.pt "
             "--reward-window-last 16 --lr 5e-7")
 COLLECT = {"coll_sft": ("collect", dict(n_examples=1_200_000, out_name="ufw8b_ctx8_64_sft_1200k", batch=64, per_window=8, p_lo=8, p_hi=64, w_lo=8,
                                          w_hi=64, max_wins=4, seed=61, hf_stream=UFW(5_500_000), w_full=True)),
@@ -128,6 +129,7 @@ def main():
     if "eval_cache" not in d:
         for key in ("coll_ev864", "coll_ev2048"):
             wait_bank(d, key)
+        wait_call(SAE16K_PEAKS_CALL, "16k-SAE corpus peaks")
         info = modal.Function.from_name("maemm-8b-eval-cache", "build").remote()
         d["eval_cache"] = {"path": CACHE, "info": info, "built": now()}; save(d); log(f"eval cache built: {json.dumps(info)[:400]}")
     if "base_eval" not in d:

@@ -99,3 +99,61 @@ def whiten_mu(n_windows: int = 8192, skip: int = 13_000_000, batch: int = 32, ma
     vol.commit()
     print(json.dumps(meta), flush=True)
     return meta
+
+
+SAE16K_DIR = "/data/qwen3_8b/sae16k"
+SAE16K_SUB = "saes_Qwen_Qwen3-8B_batch_top_k/resid_post_layer_27/trainer_0"   # 16,384 features, k=80: the UNSEEN eval SAE of the 8B chain
+
+
+@app.function(image=image, gpu="H200:1", volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], cpu=16,
+              memory=64 * 1024, timeout=4 * 3600)
+def sae16k_peaks(n_tokens: int = 60_000_000, skip: int = 14_000_000, ctx: int = 32, batch: int = 1024):
+    """Karvonen's 16k L27 SAE (trainer_0; no published max-acts file) -> /data/qwen3_8b/sae16k/{ae.pt, config.json, peaks.npy}.
+    peaks[f] = max pre-topk activation relu((h-b_dec).W_enc[:,f]+b_enc[f]) over an n_tokens scan of standalone ctx-token contexts
+    ([sink] + ctx-1 text tokens, sink position excluded) -- the same context setup as his 65k max-acts file (60M tokens, ctx 32).
+    Documents: Ultra-FineWeb en, ordered stream from index 14,000,000 (disjoint from every training / eval range)."""
+    import json, shutil, sys, time
+    import numpy as np
+    import torch
+    from huggingface_hub import hf_hub_download
+    sys.path.insert(0, "/pmx"); sys.path.insert(0, "/pmx/helpers")
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from collect_acts27b_worker import StreamReader
+    from mxf.config import MODEL, PROFILE, READ_LAYER
+    from mxf.inject import read_resid
+    assert PROFILE == "qwen3-8b", PROFILE
+    os.makedirs(SAE16K_DIR, exist_ok=True)
+    for fn in ("ae.pt", "config.json", "eval_results.json"):
+        shutil.copyfile(hf_hub_download("adamkarvonen/qwen3-8b-saes", f"{SAE16K_SUB}/{fn}"), f"{SAE16K_DIR}/{fn}")
+    p = torch.load(f"{SAE16K_DIR}/ae.pt", map_location="cpu", weights_only=False)
+    W = p["encoder.weight"].float().T.contiguous().cuda()       # [d, F]
+    be, bd, thr = p["encoder.bias"].float().cuda(), p["b_dec"].float().cuda(), float(p["threshold"])
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    sink = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
+    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map={"": "cuda:0"}).eval()
+    reader = StreamReader({"dataset": "openbmb/Ultra-FineWeb", "config": None, "split": "en", "skip": skip, "shuffle": False}, 0, 1, 0, None)
+    peaks = torch.zeros(W.shape[1], device="cuda"); fires = torch.zeros(W.shape[1], device="cuda", dtype=torch.long)
+    L, seen, chunks, t0 = ctx - 1, 0, [], time.time()
+
+    def run(cs):
+        ids = torch.tensor([[sink] + c for c in cs], device="cuda:0")
+        with torch.no_grad():
+            h, _ = read_resid(model, READ_LAYER, {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, pool="all")
+            a = torch.relu((h[:, 1:, :].reshape(-1, h.shape[-1]) - bd) @ W + be)
+            peaks.copy_(torch.maximum(peaks, a.amax(0))); fires.add_((a > thr).sum(0))
+
+    for text in reader.docs():
+        t = tok(text, add_special_tokens=False)["input_ids"]
+        chunks += [t[i:i + L] for i in range(0, len(t) - L + 1, L)]
+        while len(chunks) >= batch:
+            run(chunks[:batch]); chunks = chunks[batch:]; seen += batch * L
+        if seen >= n_tokens:
+            break
+    np.save(f"{SAE16K_DIR}/peaks.npy", peaks.cpu().numpy()); np.save(f"{SAE16K_DIR}/fire_counts.npy", fires.cpu().numpy())
+    meta = {"sae": f"{SAE16K_DIR}/ae.pt", "dict_size": int(W.shape[1]), "threshold": thr, "tokens": int(seen), "ctx": ctx,
+            "doc_range": reader.state()["doc_range"], "live_features": int((peaks > thr).sum()), "peak_median": float(peaks.median()),
+            "seconds": round(time.time() - t0)}
+    json.dump(meta, open(f"{SAE16K_DIR}/peaks.json", "w"), indent=1)
+    vol.commit()
+    print(json.dumps(meta), flush=True)
+    return meta

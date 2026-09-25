@@ -4,10 +4,12 @@
         realact_ctx8_64_dirs     [512, 4096]  standalone 8-64-token windows (the SFT recipe), Ultra-FineWeb eval head (docs < 100k)
         realact_ctx64_2048_dirs  [512, 4096]  full-document forwards, ctx 64-2048 (the RL recipe), eval head (docs 50k-100k)
         random_dirs              [512, 4096]  seeded Gaussian control (never trained on)
-        sae_dirs / sae_feats / corpus_peak    512 EVAL-split features of Karvonen's L27 SAE: unit encoder rows, ids, top act of the
-                                              60M-token max-acts scan (the always-scored "sae" family; loaded SAE = --eval-sae)
-        sae8b_{enc,dec}_dirs / _feats / _corpus_peak   the SAME 512 features as encoder / decoder directions, scored through the
-                                              encoder SLICE (eval_universal.SliceSAE) exactly like the 27B's sae2m_{enc,dec} panel
+        sae_dirs / sae_feats / corpus_peak    the UNSEEN SAE (the 27B's 131k role): 512 live features of Karvonen's 16k L27 SAE
+                                              (trainer_0, never in any bank), unit encoder rows, peaks of our 60M-token ctx-32 scan;
+                                              the always-scored "sae" family -> the evaluator's --eval-sae is /data/qwen3_8b/sae16k/ae.pt
+        sae8b_{enc,dec}_dirs / _feats / _corpus_peak   the TRAINED SAE (the 27B's 2M role): 512 EVAL-split features of Karvonen's 65k
+                                              L27 SAE (trainer_2) as encoder / decoder directions, peaks of his 60M-token max-acts scan,
+                                              scored through the encoder SLICE (eval_universal.SliceSAE) exactly like sae2m_{enc,dec}
         sae_slice = {feats, W_enc [d, m], b_enc, b_dec, threshold, F, ae}
         meta: cos_families = [realact_ctx8_64, realact_ctx64_2048, random], sae_slice_families = [sae8b_enc, sae8b_dec], n, seed, d_sae
 
@@ -25,7 +27,9 @@ image = (modal.Image.debian_slim(python_version="3.11")
 vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
 OUT = "/data/eval_universal_ho/eval_sets_8b.pt"
 BANKS = {"realact_ctx8_64": "/data/banks/ufw8b_ctx8_64_evalhead_32k", "realact_ctx64_2048": "/data/banks/ufw8b_ctx64_2048_evalhead_32k"}
-SAE = "/data/qwen3_8b/sae/ae.pt"
+SAE = "/data/qwen3_8b/sae/ae.pt"                   # trained SAE (65k, trainer_2): slice families
+SAE16K = "/data/qwen3_8b/sae16k/ae.pt"             # unseen SAE (16k, trainer_0): the "sae" family
+PEAKS16K = "/data/qwen3_8b/sae16k/peaks.npy"
 MAXACTS = "/data/qwen3_8b/sae/max_acts_top30_ctx32.pt"
 SPLIT = "/data/qwen3_8b/sae/feature_split.npz"
 D = 4096
@@ -77,13 +81,20 @@ def build(n: int = 512, seed: int = 8, out: str = OUT, overwrite: bool = False):
     peak = ma.amax(dim=(1, 2))[torch.from_numpy(feats)]
     ft = torch.from_numpy(feats)
     enc_u, dec_u = F.normalize(W_enc[ft], dim=-1), F.normalize(W_dec[ft], dim=-1)
-    es.update({"sae_dirs": enc_u, "sae_feats": feats.tolist(), "corpus_peak": peak})
+    q = torch.load(SAE16K, map_location="cpu", weights_only=False)
+    W16, thr16 = q["encoder.weight"].float(), float(q["threshold"])
+    pk16 = np.load(PEAKS16K)
+    live16 = np.flatnonzero(pk16 > thr16)
+    f16 = np.sort(np.random.default_rng(seed + 1).choice(live16, size=n, replace=False)).astype(np.int64)
+    es.update({"sae_dirs": F.normalize(W16[torch.from_numpy(f16)], dim=-1), "sae_feats": f16.tolist(),
+               "corpus_peak": torch.from_numpy(pk16[f16]).float()})
     for fam, dirs in (("sae8b_enc", enc_u), ("sae8b_dec", dec_u)):
         es.update({f"{fam}_dirs": dirs, f"{fam}_feats": torch.from_numpy(feats), f"{fam}_corpus_peak": peak})
     es["sae_slice"] = {"feats": torch.from_numpy(feats), "W_enc": W_enc[ft].T.contiguous(), "b_enc": b_enc[ft], "b_dec": b_dec,
                        "threshold": thr, "F": int(W_enc.shape[0]), "ae": SAE, "maxacts": MAXACTS}
     es["meta"] = {"mode": "heldout_pool", "heldout_pool": "qwen3-8b eval head + Karvonen SAE eval split", "n": n, "seed": seed,
-                  "d_sae": int(W_enc.shape[0]), "cos_families": ["realact_ctx8_64", "realact_ctx64_2048", "random"],
+                  "d_sae": int(W16.shape[0]), "unseen_sae": {"path": SAE16K, "live": int(len(live16)), "threshold": thr16},
+                  "cos_families": ["realact_ctx8_64", "realact_ctx64_2048", "random"],
                   "sae_slice_families": ["sae8b_enc", "sae8b_dec"], "version": "8b-1", "model": "Qwen/Qwen3-8B", "layer": 27,
                   "realact": prov, "sae_eval_features": {"n_eval_split": int(len(ev)), "threshold": thr, "corpus_peak_median": float(peak.median())}}
     torch.save(es, out + ".tmp"); os.replace(out + ".tmp", out)
