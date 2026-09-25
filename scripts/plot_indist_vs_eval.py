@@ -27,7 +27,7 @@ TAGS = {"evals_sft": "sft_simple2m_sft_ctx864_c", "evals_rl": "rl_simple2m_8x204
 CTX = "eval/realact_ctx8_64/cos"
 STYLES = [("dec", "-", "decoder directions"), ("enc", "--", "encoder directions")]
 BASE_C = "#8c8c8c"                                   # untrained base model: gray dotted reference line (as in the paper figures)
-BASE_TAGS = {CTX: "base_qwen36_27b_ctx864_c", "sae2m": "base_qwen36_27b_c"}   # step 0 = Qwen3.6-27B, no MAEM training
+BASE_TAGS = {CTX: "base_qwen36_27b_ctx864_c", "sae2m": "base_qwen36_27b_c"}   # the v3 base eval also carries the 131k "sae" family   # step 0 = Qwen3.6-27B, no MAEM training
 
 
 def base_value(key):
@@ -39,10 +39,13 @@ def base_value(key):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--strength", action="store_true")
     ap.add_argument("--zoom", action="store_true", help="panel (a) zoomed to 0.675-0.725 (the base-model line is then off-scale, omitted)")
+    ap.add_argument("--sae", choices=["trained", "unseen"], default="trained",
+                    help="(b): held-out features of the SAE the SFT data came from (2M; enc + dec) or the 131k SAE never trained on (enc)")
     a = ap.parse_args()
     metric, stem = ("norm_act", "indist_vs_eval_strength") if a.strength else ("fired", "indist_vs_eval")
-    stem += "_zoom" if a.zoom else ""
-    SAE = [(f"eval/sae2m_{d}/{metric}", ls, lab) for d, ls, lab in STYLES]
+    stem += ("_unseen" if a.sae == "unseen" else "") + ("_zoom" if a.zoom else "")
+    SAE = ([(f"eval/sae/{metric}", "-", None)] if a.sae == "unseen" else
+           [(f"eval/sae2m_{d}/{metric}", ls, lab) for d, ls, lab in STYLES])
     raw = json.load(open(cve.RAW))
     for side, tag in TAGS.items():                      # merge the 8-64 family into the per-checkpoint eval dicts
         for f in glob.glob(f"{EVJ}/{tag}/ckpt_*.json"):
@@ -78,13 +81,16 @@ def main():
         bv = base_value(key); data["base_model"][key] = bv
         if bv is not None:
             ax_b.axhline(100 * bv, color=BASE_C, ls=":", lw=1.8, zorder=2)
+    which = "unseen SAE (131k features)" if a.sae == "unseen" else "trained SAE, held-out features"
+    top = max(100 * p["evals"][k] for k, _, _ in SAE for _, p in sft_pts + rl_pts)
     if a.strength:
-        ax_b.set_title("(b) trained SAE, held-out features: strength"); ax_b.set_ylabel("target activation (% of corpus peak)")
-        ax_b.set_ylim(0, 35); ax_b.yaxis.set_major_locator(plt.MultipleLocator(5))
+        ax_b.set_title(f"(b) {which}: strength"); ax_b.set_ylabel("target activation (% of corpus peak)")
     else:
-        ax_b.set_title("(b) trained SAE, held-out features: fires"); ax_b.set_ylabel("% of SAE features fired")
-        ax_b.set_ylim(0, 45); ax_b.yaxis.set_major_locator(plt.MultipleLocator(10))
-    ax_b.legend(handles=[Line2D([], [], color="#444444", lw=1.8, ls=ls, label=lab) for _, ls, lab in SAE], loc="upper left", frameon=False)
+        ax_b.set_title(f"(b) {which}: fires"); ax_b.set_ylabel("% of SAE features fired")
+    step = 10 if top > 40 else 5
+    ax_b.set_ylim(0, step * (int(top // step) + 1)); ax_b.yaxis.set_major_locator(plt.MultipleLocator(step))
+    if a.sae == "trained":
+        ax_b.legend(handles=[Line2D([], [], color="#444444", lw=1.8, ls=ls, label=lab) for _, ls, lab in SAE], loc="upper left", frameon=False)
     xs = [x for x, _ in sft_pts + rl_pts]; lo, hi = min(xs) / 1.3, max(xs) * 1.3
     ts = [t for t in cve.doubling_ticks(min(xs), hi) if t >= lo]
     for ax in (ax_a, ax_b):

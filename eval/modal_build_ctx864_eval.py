@@ -71,3 +71,28 @@ def build(bank: str = BANK, n: int = 512, seed: int = 864, out: str = OUT, overw
     info = {k: v for k, v in meta["ctx864"].items() if k != "rows"}
     print(json.dumps(info), flush=True)
     return info
+
+
+@app.function(image=image, cpu=8, memory=16 * 1024, volumes={"/data": vol}, timeout=3600)
+def make_base_ckpt(out: str = "/data/base_ckpt/qwen36_27b/step_0", model: str = "Qwen/Qwen3.6-27B"):
+    """The UNTRAINED base model as a full-model checkpoint dir (HF snapshot files copied, symlinks resolved, + SAVE_DONE) so
+    eval_ckpt_daemon --full-model --only-step 0 scores it through the identical protocol (injection, generation, scorer, check)."""
+    import glob, json, shutil, time
+    vol.reload()
+    root = f"/data/hf_cache/hub/models--{model.replace('/', '--')}"
+    rev = open(f"{root}/refs/main").read().strip()
+    snap = f"{root}/snapshots/{rev}"
+    assert os.path.isdir(snap), snap
+    if os.path.exists(f"{out}/SAVE_DONE"):
+        return {"out": out, "status": "exists"}
+    os.makedirs(out, exist_ok=True)
+    t0, n = time.time(), 0
+    for src in sorted(glob.glob(f"{snap}/*")):
+        if os.path.isfile(src):
+            shutil.copyfile(os.path.realpath(src), f"{out}/{os.path.basename(src)}"); n += 1
+    json.dump({"step": 0, "source": snap, "model": model, "revision": rev, "note": "untrained base model (no MAEM training)"},
+              open(f"{out}/SAVE_DONE", "w"))
+    vol.commit()
+    info = {"out": out, "files": n, "revision": rev, "seconds": round(time.time() - t0)}
+    print(json.dumps(info), flush=True)
+    return info
