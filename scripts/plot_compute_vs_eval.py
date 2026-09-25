@@ -31,7 +31,7 @@ R, EX_PER_STEP, RL_DIRS_PER_STEP, SFT_ROWS, SCORE_LAYER_FRAC = 16384, 4096, 2048
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "xtick.labelsize": 11,
                      "ytick.labelsize": 11, "legend.fontsize": 11, "axes.linewidth": 0.8, "grid.color": "#b0b0b0", "grid.alpha": 0.35,
                      "grid.linewidth": 0.8, "mathtext.default": "regular"})
-METRICS = [("eval/realact/cos", 1, "(a) real activations: centred cosine", "mean cosine", 0.05, "{x:.2f}"),
+METRICS = [("eval/realact/cos", 1, "(a) real activations, short context", "mean centred cosine", 0.05, "{x:.2f}"),
            ("eval/sae/fired", 100, "(b) SAE features: target fires", "% of SAE features fired", 5, "{x:.0f}")]
 # x key -> axis name per origin, linear-axis divisor, linear unit suffix
 XLAB = {"flops": {"sft_end": "training compute", "zero": "compute spent in each stage"},
