@@ -33,7 +33,7 @@ def main():
     N, sft, rl, _ = cve.budgets(raw)
     off = sft[-1]["flops"]
     sft_pts = [(p["flops"] / 1e19, p) for p in sft]; rl_pts = [((off + p["flops"]) / 1e19, p) for p in rl]
-    fig, axes = plt.subplots(2, 2, figsize=(9.6, 8.6), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(9.6, 8.6), sharex=True)
     data = {"x": "cumulative training compute (1e19 FLOPs), RL stacked on the SFT final", "eval": "centered cosine, best of 4 at T=1, n=512",
             "families": {}}
     for ax, (key, title) in zip(axes.flat, PANELS):
@@ -51,9 +51,10 @@ def main():
         ax.set_xlabel(r"training compute ($10^{19}$ FLOPs)")
     for ax in axes[:, 0]:
         ax.set_ylabel("mean centred cosine")
-    axes[0, 0].yaxis.set_major_locator(plt.MultipleLocator(0.1)); axes[0, 0].yaxis.set_major_formatter("{x:.1f}")
-    axes[0, 0].set_ylim(0.35, 0.85)
-    axes[0, 0].legend(loc="lower right", frameon=False)
+    for ax in axes.flat[1:]:                             # (b)-(d) share one scale; (a) is zoomed (its changes are ~0.02)
+        ax.set_ylim(0.35, 0.85); ax.yaxis.set_major_locator(plt.MultipleLocator(0.1)); ax.yaxis.set_major_formatter("{x:.1f}")
+    axes[0, 0].set_ylim(0.675, 0.725); axes[0, 0].yaxis.set_major_locator(plt.MultipleLocator(0.01)); axes[0, 0].yaxis.set_major_formatter("{x:.2f}")
+    axes[0, 1].legend(loc="lower left", frameon=False)
     fig.tight_layout(w_pad=1.5, h_pad=1.5)
     os.makedirs(f"{cve.OUT}/data", exist_ok=True)
     for ext in ("png", "pdf"):
