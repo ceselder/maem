@@ -2,7 +2,10 @@
 131k-SAE unseen eval) and its scaled-down Qwen3-8B copy (branch qwen3-8b; Karvonen 65k-SAE data, Karvonen 16k-SAE unseen eval).
 Colour = stage (SFT blue, RL orange), line style = model (27B solid, 8B dashed), grey = the untrained base model of each.
 Compute: the codebase's meter convention per model (plot_compute_vs_eval docstring; N from each SFT meter, scoring-pass layer
-fraction 43/64 for 27B, 28/36 for 8B); each chain's RL is stacked on its own SFT final.
+fraction 43/64 for 27B, 28/36 for 8B); each chain's RL is stacked on its own SFT final. Both chains count the 102-token shared
+prompt prefix ONCE: the 27B ran with the prefix cache (its logged token counts already exclude it); the 8B ran without it (that
+cache is Qwen3.6-specific), so its logged per-example / per-rollout counts include the prefix and it is subtracted here
+(prefix_uncounted) -- same algorithmic accounting for both; the 8B's actually-spent compute was higher by that amount.
 
     python scripts/plot_indist_models.py [--metric strength|fired] [--sae unseen|trained]
       (a) held-out standalone 8-64-token windows (each SFT's own recipe), centred cosine
@@ -27,11 +30,11 @@ spec.loader.exec_module(cve)
 EVJ = os.path.expanduser("~/shared/overnight/eval_ckpt_json")
 CTX = "eval/realact_ctx8_64/cos"
 CHAINS = {
-    "27b": dict(label="Qwen3.6-27B", ls="-", base_ls=":", raw="~/shared/overnight/simple2m/flops_plot_raw_27b.json", sft_rows=8_000_000,
+    "27b": dict(label="Qwen3.6-27B", ls="-", base_ls=":", prefix_uncounted=0, raw="~/shared/overnight/simple2m/flops_plot_raw_27b.json", sft_rows=8_000_000,
                 score_frac=43 / 64, ctx_tags=("sft_simple2m_sft_ctx864_c", "rl_simple2m_8x2048_last16_lr5e-7_ctx864_c"),
                 base={CTX: "base_qwen36_27b_ctx864_c", "*": "base_qwen36_27b_c"},
                 sae={"unseen": "eval/sae/{m}", "trained": "eval/sae2m_dec/{m}"}, unseen_name="131k", trained_name="2M"),
-    "8b": dict(label="Qwen3-8B", ls="--", base_ls="-.", raw="~/shared/overnight/qwen3_8b/flops_plot_raw_8b.json", sft_rows=1_992_840,
+    "8b": dict(label="Qwen3-8B", ls="--", base_ls="-.", prefix_uncounted=102, raw="~/shared/overnight/qwen3_8b/flops_plot_raw_8b.json", sft_rows=1_992_840,
                score_frac=28 / 36, ctx_tags=None, base={"*": "base_qwen3_8b"},
                sae={"unseen": "eval/sae/{m}", "trained": "eval/sae8b_dec/{m}"}, unseen_name="16k", trained_name="65k"),
 }
@@ -47,8 +50,10 @@ def chain_points(c):
                 if k in raw[side]:
                     raw[side][k][CTX] = json.load(open(f))["metrics"][CTX]
     sft_rows = sorted(raw["sft_rows"], key=lambda x: x["_step"]); rl_rows = sorted(raw["rl_rows"], key=lambda x: x["_step"])
-    sft_fl = np.cumsum([6 * N * EX_PER_STEP * x["tok_per_s"] / x["ex_per_s"] for x in sft_rows])
-    rl_fl = np.cumsum([R * N * (8 * x["trainer/body_tokens_per_rollout"] + 2 * c["score_frac"] * (x["rollout/len_mean"] + 1)) for x in rl_rows])
+    P = c["prefix_uncounted"]                           # shared prompt prefix counted once (see docstring)
+    sft_fl = np.cumsum([6 * N * EX_PER_STEP * (x["tok_per_s"] / x["ex_per_s"] - P) for x in sft_rows])
+    rl_fl = np.cumsum([R * N * (8 * (x["trainer/body_tokens_per_rollout"] - P) + 2 * c["score_frac"] * (x["rollout/len_mean"] + 1))
+                       for x in rl_rows])
     es = {int(k): v for k, v in raw["evals_sft"].items()}; er = {int(k): v for k, v in raw["evals_rl"].items() if int(k) <= len(rl_fl)}
     sft = [(float(sft_fl[min(k, len(sft_fl)) - 1]), k, es[k]) for k in sorted(es)]
     rl = [(sft[-1][0], 0, sft[-1][2])] + [(sft[-1][0] + float(rl_fl[k - 1]), k, er[k]) for k in sorted(er)] if er else []
@@ -69,11 +74,12 @@ def main():
     m = "norm_act" if a.metric == "strength" else "fired"
     stem = f"indist_models_{a.sae}_{a.metric}"
     fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(9.6, 5.4))
-    data, xs = {"metric": m, "sae": a.sae, "chains": {}}, []
+    data, xs = {"metric": m, "sae": a.sae, "chains": {}, "accounting": "shared 102-token prompt prefix counted once for both chains"}, []
     for name, c in CHAINS.items():
         N, sft, rl = chain_points(c)
         skey = c["sae"][a.sae].format(m=m)
-        cd = {"N": N, "sae_key": skey, "sft": [], "rl": [], "base": {CTX: base_metrics(c, CTX), skey: base_metrics(c, skey)}}
+        cd = {"N": N, "prefix_uncounted": c["prefix_uncounted"], "sft_flops_total": sft[-1][0], "rl_flops_total": (rl[-1][0] - sft[-1][0]) if rl else 0,
+              "sae_key": skey, "sft": [], "rl": [], "base": {CTX: base_metrics(c, CTX), skey: base_metrics(c, skey)}}
         for ax, key, sc in ((ax_a, CTX, 1), (ax_b, skey, 100)):
             if rl:
                 ax.plot([x / 1e19 for x, _, _ in rl], [sc * e[key] for _, _, e in rl], c["ls"], marker="o", color=cve.RL_C, lw=1.8, ms=4,
@@ -106,7 +112,9 @@ def main():
                 loc="center right", frameon=False, fontsize=10)
     ax_b.legend(handles=[Line2D([], [], color="#444444", ls=c["ls"], lw=1.8,
                                 label=f"{c['label']}" + (f" ({c['unseen_name' if a.sae == 'unseen' else 'trained_name']}-feature SAE)"))
-                         for c in CHAINS.values()], loc="upper left", frameon=False, fontsize=10)
+                         for c in CHAINS.values()], frameon=False, fontsize=10,
+                **({"loc": "lower left", "bbox_to_anchor": (0.0, 0.2)} if (a.sae, a.metric) == ("unseen", "fired") else
+                   {"loc": "upper left" if (a.sae, a.metric) == ("unseen", "strength") else "center"}))
     fig.tight_layout(w_pad=2.0)
     os.makedirs(f"{cve.OUT}/data", exist_ok=True)
     for ext in ("png", "pdf"):
