@@ -120,6 +120,7 @@ def main():
                                 label=f"{c['label']}" + (f" ({c['unseen_name' if a.sae == 'unseen' else 'trained_name']}-feature SAE)"))
                          for c in CHAINS.values()], frameon=False, fontsize=10,
                 **({"loc": "lower left", "bbox_to_anchor": (0.0, 0.2)} if (a.sae, a.metric) == ("unseen", "fired") else
+                   {"loc": "center right", "bbox_to_anchor": (1.0, 0.7)} if (a.sae, a.metric) == ("trained", "strength") else
                    {"loc": {("unseen", "strength"): "upper left", ("trained", "strength"): "upper right"}.get((a.sae, a.metric), "center right")}))
     fig.tight_layout(w_pad=2.0)
     os.makedirs(f"{cve.OUT}/data", exist_ok=True)
