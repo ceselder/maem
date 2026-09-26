@@ -74,9 +74,12 @@ def main():
     m = "norm_act" if a.metric == "strength" else "fired"
     stem = f"indist_models_{a.sae}_{a.metric}"
     fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(9.6, 5.4))
-    data, xs = {"metric": m, "sae": a.sae, "chains": {}, "accounting": "shared 102-token prompt prefix counted once for both chains"}, []
+    data, xs = {"metric": m, "sae": a.sae, "chains": {}, "accounting": "shared 102-token prompt prefix counted once for both chains",
+                "untrained": "each chain's untrained base model is the first point of its SFT line, at the nominal tick '0'"}, []
+    pts = {name: chain_points(c) for name, c in CHAINS.items()}
+    x0 = min(sft[0][0] for _, sft, _ in pts.values()) / 1e19 / 3          # nominal x of the untrained point (log axis has no 0)
     for name, c in CHAINS.items():
-        N, sft, rl = chain_points(c)
+        N, sft, rl = pts[name]
         skey = c["sae"][a.sae].format(m=m)
         cd = {"N": N, "prefix_uncounted": c["prefix_uncounted"], "sft_flops_total": sft[-1][0], "rl_flops_total": (rl[-1][0] - sft[-1][0]) if rl else 0,
               "sae_key": skey, "sft": [], "rl": [], "base": {CTX: base_metrics(c, CTX), skey: base_metrics(c, skey)}}
@@ -84,18 +87,21 @@ def main():
             if rl:
                 ax.plot([x / 1e19 for x, _, _ in rl], [sc * e[key] for _, _, e in rl], c["ls"], marker="o", color=cve.RL_C, lw=1.8, ms=4,
                         markevery=slice(1, None), zorder=4)
-            ax.plot([x / 1e19 for x, _, _ in sft], [sc * e[key] for _, _, e in sft], c["ls"], marker="o", color=cve.SFT_C, lw=1.8, ms=4, zorder=3)
             b = cd["base"][key]
+            bx, by = ([x0], [sc * b]) if b is not None else ([], [])
+            ax.plot(bx + [x / 1e19 for x, _, _ in sft], by + [sc * e[key] for _, _, e in sft], c["ls"], marker="o", color=cve.SFT_C, lw=1.8, ms=4,
+                    zorder=3)
             if b is not None:
                 ax.axhline(sc * b, color=cve.BASE_C if hasattr(cve, "BASE_C") else "#8c8c8c", ls=c["base_ls"], lw=1.6, zorder=2)
         cd["sft"] = [{"step": k, "flops": x, CTX: e.get(CTX), skey: e.get(skey)} for x, k, e in sft]
         cd["rl"] = [{"step": k, "flops": x, CTX: e.get(CTX), skey: e.get(skey)} for x, k, e in rl]
         data["chains"][name] = cd
         xs += [x / 1e19 for x, _, _ in sft + rl]
-    lo, hi = min(xs) / 1.3, max(xs) * 1.3
-    ts = [t for t in cve.doubling_ticks(min(xs), hi) if t >= lo]
+    lo, hi = x0 / 1.5, max(xs) * 1.3
+    ts = [t for t in cve.doubling_ticks(min(xs), hi) if t >= min(xs) / 1.3]
     for ax in (ax_a, ax_b):
-        ax.set_xscale("log"); ax.set_xlim(lo, hi); ax.xaxis.set_minor_locator(plt.NullLocator()); ax.set_xticks(ts, [f"{t:g}" for t in ts])
+        ax.set_xscale("log"); ax.set_xlim(lo, hi); ax.xaxis.set_minor_locator(plt.NullLocator())
+        ax.set_xticks([x0] + ts, ["0"] + [f"{t:g}" for t in ts])
         ax.set_xlabel(r"training compute ($10^{19}$ FLOPs)"); ax.grid(True); ax.set_axisbelow(True)
     ax_a.set_title("(a) real activations, 8–64-token context"); ax_a.set_ylabel("mean centred cosine")
     ax_a.set_ylim(0.0, 0.9); ax_a.yaxis.set_major_locator(plt.MultipleLocator(0.1)); ax_a.yaxis.set_major_formatter("{x:.1f}")
@@ -109,12 +115,12 @@ def main():
     ax_a.legend(handles=[Line2D([], [], color=cve.RL_C, marker="o", ms=4, lw=1.8, label="MAEM (RL, from SFT final)"),
                          Line2D([], [], color=cve.SFT_C, marker="o", ms=4, lw=1.8, label="MAEM (SFT)")] +
                         [Line2D([], [], color=gray, ls=c["base_ls"], lw=1.6, label=f"{c['label']} base (no training)") for c in CHAINS.values()],
-                loc="center right", frameon=False, fontsize=10)
+                loc="lower right", bbox_to_anchor=(1.0, 0.3), frameon=False, fontsize=10)
     ax_b.legend(handles=[Line2D([], [], color="#444444", ls=c["ls"], lw=1.8,
                                 label=f"{c['label']}" + (f" ({c['unseen_name' if a.sae == 'unseen' else 'trained_name']}-feature SAE)"))
                          for c in CHAINS.values()], frameon=False, fontsize=10,
                 **({"loc": "lower left", "bbox_to_anchor": (0.0, 0.2)} if (a.sae, a.metric) == ("unseen", "fired") else
-                   {"loc": "upper left" if (a.sae, a.metric) == ("unseen", "strength") else "center"}))
+                   {"loc": {("unseen", "strength"): "upper left", ("trained", "strength"): "upper right"}.get((a.sae, a.metric), "center right")}))
     fig.tight_layout(w_pad=2.0)
     os.makedirs(f"{cve.OUT}/data", exist_ok=True)
     for ext in ("png", "pdf"):
