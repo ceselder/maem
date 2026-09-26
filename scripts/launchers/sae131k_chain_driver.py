@@ -26,6 +26,7 @@ V3 = "/data/eval_universal_ho/eval_sets_heldout_v3.pt"
 CTX864 = "/data/eval_universal_ho/eval_sets_ctx864.pt"
 APPS = {"sft": "maemm-131k-sft", "rl": "maemm-131k-rl", "mix": "maemm-mix-5m-bank-s2m", "eval": "maemm-eval-ckpt-s2m-c"}
 SFT_RUN, SFT_MIX, RL_POOL, RL_RUN = "sae131k_sft", "mix131k_sft", "mix131k_rl", "rl_sae131k_8x2048_last16_lr5e-7"
+SFT_N_CKPTS = 20                                   # user 2026-09-26: denser SFT curve (paper chain used 8)
 EFF_BATCH, RL_STEPS = 4096, 300
 SFT_EXTRA = ("--full-ft --prefix-cache --grad-ckpt 0 --autocast-bf16 --log-steps 1 --grad-accum 16 --pad-multiple 1 --prefix-share-step "
              "--fsdp-prefetch 2")
@@ -93,6 +94,21 @@ def evaluators(ckpt_dir, tag, final_step):
                                extra_args=EVAL_CTX).object_id}
 
 
+def sft_once_evals(steps):
+    """After SFT: every saved checkpoint (step_* + final) scored in PARALLEL, one B200 per (checkpoint, cache) -- a single
+    streaming daemon would take ~20 min x 21 ckpts sequentially."""
+    names = [e.path.rsplit("/", 1)[-1] for e in VOL.listdir(f"sft_mix/{SFT_RUN}")]
+    ks = sorted(int(n.split("_")[1]) for n in names if n.startswith("step_") and n.split("_")[1].isdigit()) + (["final"] if "final" in names else [])
+    ev = modal.Function.from_name(APPS["eval"], "daemon")
+    calls = {}
+    for k in ks:
+        s = steps if k == "final" else k
+        for tag, extra in ((f"sft_{SFT_RUN}_c", EVAL_V3), (f"sft_{SFT_RUN}_ctx864_c", EVAL_CTX)):
+            calls[f"{tag}/{s}"] = ev.spawn(ckpt_dir=f"/data/sft_mix/{SFT_RUN}", tag=tag, once=True, only_step=s, final_step=steps,
+                                           extra_args=f"--full-model --no-wandb {extra}").object_id
+    return calls
+
+
 def main():
     d = load()
     if "sft" not in d:
@@ -111,10 +127,10 @@ def main():
             log(f"compose SFT {c.object_id}: acts {n} + sae {n}")
         wait_call(d["compose_sft"]["call"], "compose SFT")
         st = vol_json(f"/data/banks/{SFT_MIX}/build_stats.json"); n_rows = int(st["n_examples"]); steps = math.ceil(n_rows / EFF_BATCH)
-        t = modal.Function.from_name(APPS["sft"], "train").spawn(run_name=SFT_RUN, data_dir=f"/data/banks/{SFT_MIX}", n_ckpts=8, epochs=1,
-                                                                 batch_size=32, lr=1e-5, max_seq=192, backend="nccl", extra_args=SFT_EXTRA)
-        e = evaluators(f"/data/sft_mix/{SFT_RUN}", f"sft_{SFT_RUN}", steps)
-        d["sft"] = {"train": t.object_id, "evals": e, "rows": n_rows, "families": st["families"], "steps_expected": steps,
+        t = modal.Function.from_name(APPS["sft"], "train").spawn(run_name=SFT_RUN, data_dir=f"/data/banks/{SFT_MIX}", n_ckpts=SFT_N_CKPTS,
+                                                                 epochs=1, batch_size=32, lr=1e-5, max_seq=192, backend="nccl", extra_args=SFT_EXTRA)
+        e = "parallel once-evals after SFT (sft_once_evals)"
+        d["sft"] = {"train": t.object_id, "evals": e, "n_ckpts": SFT_N_CKPTS, "rows": n_rows, "families": st["families"], "steps_expected": steps,
                     "save": f"/data/sft_mix/{SFT_RUN}", "extra": SFT_EXTRA, "spawned": now()}; save(d)
         log(f"SFT spawned: train {t.object_id} evals {e}: {n_rows} rows, {steps} steps")
     if "compose_rl" not in d:
@@ -137,6 +153,9 @@ def main():
             if vol_has(final):
                 break
             time.sleep(60)
+        if "evals_once" not in d["sft"]:
+            d["sft"]["evals_once"] = sft_once_evals(d["sft"]["steps_expected"]); save(d)
+            log(f"SFT once-evals spawned: {len(d['sft']['evals_once'])} calls")
         save_dir = f"/data/ckpts_{RL_RUN}"
         extra = f"{RL_EXTRA} --run-name {RL_RUN} --save-dir {save_dir}"
         t = modal.Function.from_name(APPS["rl"], "train").spawn(n_rollout=2, n_trainer=6, total_steps=RL_STEPS, extra_args=extra,
